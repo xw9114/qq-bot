@@ -11,6 +11,7 @@ from openai import AsyncOpenAI
 config = get_driver().config
 api_key = getattr(config, "openai_api_key", None)
 base_url = getattr(config, "openai_base_url", None)
+model_name = getattr(config, "openai_model", "gpt-5.4-mini")
 
 if not api_key:
     logger.warning("未配置 OPENAI_API_KEY，ChatGPT 功能将不可用")
@@ -76,10 +77,11 @@ async def handle_help(event: MessageEvent):
   拍 @某人     生成拍打 GIF
   亲 @某人     生成亲亲 GIF
   膜 @某人     生成膜拜 GIF
-  鲁迅说 [文字]  经典鲁迅梗图
-  举牌 [文字]  举牌表情包
-  petpet帮助   查看全部 50+ 种表情
-  表情帮助     查看全部 100+ 种梗图模板
+  /鲁迅说 [文字]  经典鲁迅梗图
+  /举牌 [文字]  举牌表情包
+  /头像相关表情包  查看 PetPet 动图指令
+  /表情包制作      查看 Memes 梗图模板
+  /表情帮助 [关键词] 查看指定梗图详情
 
 ━━━━━━━━━━━━━━━
 ♟️ 棋类游戏（群聊，需 @机器人）
@@ -121,7 +123,7 @@ async def handle_quiz(event: MessageEvent):
         return
     try:
         response = await client.chat.completions.create(
-            model="gpt-5",
+            model=model_name,
             messages=[{"role": "user", "content": "出一道有趣的知识问答题，格式：\n题目：xxx\n答案：xxx\n只输出这两行"}]
         )
         text = response.choices[0].message.content
@@ -150,7 +152,7 @@ async def handle_answer(event: MessageEvent, args: Message = CommandArg()):
         return
     try:
         response = await client.chat.completions.create(
-            model="gpt-5",
+            model=model_name,
             messages=[{"role": "user", "content": f"正确答案'{quiz_answers[user_id]}'，用户答'{user_answer}'，只回复：✅ 回答正确！或 ❌ 错误，答案是xxx"}]
         )
         result = response.choices[0].message.content
@@ -188,7 +190,7 @@ async def handle_tarot(event: MessageEvent):
     position = "逆位" if random.choice([True, False]) else "正位"
     try:
         response = await client.chat.completions.create(
-            model="gpt-5",
+            model=model_name,
             messages=[{"role": "user", "content": f"塔罗牌【{card}】{position}，神秘语气解读，50字以内"}]
         )
         await tarot_cmd.finish(Message(f"🎴【{card}】{position}\n\n{response.choices[0].message.content}"))
@@ -207,7 +209,7 @@ async def handle_joke(event: MessageEvent):
         return
     try:
         response = await client.chat.completions.create(
-            model="gpt-5",
+            model=model_name,
             messages=[{"role": "user", "content": "讲一个简短笑话，有反转结尾，不超过80字"}]
         )
         await joke_cmd.finish(Message(f"😄 {response.choices[0].message.content}"))
@@ -236,7 +238,7 @@ BLOCKED_KEYWORDS = {
     "抽老婆", "随机老婆", "抽wife", "随机wife", "今日wife", "今日老婆",
     "塔罗", "占卜", "抽牌", "笑话", "joke", "一言", "一句",
     # 表情包与梗图
-    "摸", "拍", "亲", "膜", "鲁迅说", "举牌", "petpet帮助", "表情帮助",
+    "摸", "拍", "亲", "膜",
     # 棋类游戏
     "五子棋", "围棋", "黑白棋", "奥赛罗", "落子", "悔棋",
     "显示棋盘", "显示棋局", "查看棋盘", "查看棋局",
@@ -319,7 +321,7 @@ async def process_chat(matcher, bot: Bot, event: MessageEvent):
         messages = [{"role": "system", "content": system}] + user_history[user_id]
 
         response = await client.chat.completions.create(
-            model="gpt-5", messages=messages
+            model=model_name, messages=messages
         )
         reply = response.choices[0].message.content
 
@@ -335,8 +337,8 @@ async def process_chat(matcher, bot: Bot, event: MessageEvent):
     except FinishedException:
         pass
     except Exception as e:
-        logger.error(f"调用 API 失败: {e}", exc_info=True)
-        await matcher.finish(f"❌ 调用失败: {str(e)}")
+        logger.opt(exception=True).error("调用 API 失败: {}", e)
+        await matcher.finish("❌ 调用失败，请稍后重试")
 
 @greet_chat.handle()
 async def handle_greet(bot: Bot, event: MessageEvent):

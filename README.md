@@ -138,6 +138,7 @@ ws://127.0.0.1:8080/onebot/v11/ws
 | --- | --- | --- | --- |
 | `OPENAI_API_KEY` | 是 | - | OpenAI 或兼容服务的 API Key |
 | `OPENAI_BASE_URL` | 否 | SDK 默认地址 | OpenAI 兼容接口地址 |
+| `OPENAI_MODEL` | 否 | `gpt-5.4-mini` | 对话、问答和娱乐功能使用的模型 |
 | `DRIVER` | 是 | `~fastapi+~httpx+~websockets` | NoneBot 驱动器组合 |
 | `HOST` | 否 | `127.0.0.1` | NoneBot 监听地址 |
 | `PORT` | 否 | `8080` | NoneBot 监听端口 |
@@ -145,8 +146,9 @@ ws://127.0.0.1:8080/onebot/v11/ws
 | `SUPERUSERS` | 否 | `[]` | 超级用户 QQ 号集合 |
 | `DATABASE_URL` | 否 | SQLite | 棋类等插件使用的数据库地址 |
 | `BOARDGAME_TIMEOUT` | 否 | `600` | 棋局超时时间，单位为秒 |
+| `MEMES_COMMAND_PREFIXES` | 否 | `["/"]` | Memes 使用独立前缀，避免与 PetPet 指令冲突 |
 
-当前 AI 模型在 [`plugins/claude_chat.py`](plugins/claude_chat.py) 中设置为 `gpt-5`。如果兼容服务没有同名模型，需要在该文件中修改模型名。
+当前 AI 模型可通过 `.env` 中的 `OPENAI_MODEL` 设置；使用兼容服务时，应填写该服务实际提供的模型名称。
 
 ### 检查 API 连通性
 
