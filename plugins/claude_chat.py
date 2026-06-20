@@ -7,6 +7,8 @@ from nonebot.exception import FinishedException
 from nonebot.params import CommandArg
 from openai import AsyncOpenAI
 
+from .user_titles import get_mentioned_titles_prompt, get_user_title_prompt
+
 # 从环境变量获取 API Key 和 Base URL
 config = get_driver().config
 api_key = getattr(config, "openai_api_key", None)
@@ -63,6 +65,12 @@ async def handle_help(event: MessageEvent):
   /问答        出题开始竞赛
   /答案 [内容] 提交你的答案
   /退出问答    结束问答
+
+━━━━━━━━━━━━━━━
+🏷 用户称号
+  /设置称号 [QQ号/@用户] [称号]  管理员设置称号
+  /查看称号 [QQ号/@用户]         查看称号（留空查看自己）
+  /删除称号 [QQ号/@用户]         管理员删除称号
 
 ━━━━━━━━━━━━━━━
 🎮 娱乐
@@ -309,6 +317,8 @@ async def process_chat(matcher, bot: Bot, event: MessageEvent):
         system = SYSTEM_PROMPT
         if user_modes.get(user_id) == "roleplay" and user_id in user_roles:
             system = user_roles[user_id]
+        system += await get_user_title_prompt(user_id)
+        system += await get_mentioned_titles_prompt(user_msg)
 
         # 初始化历史
         if user_id not in user_history:

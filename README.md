@@ -144,11 +144,14 @@ ws://127.0.0.1:8080/onebot/v11/ws
 | `PORT` | 否 | `8080` | NoneBot 监听端口 |
 | `COMMAND_START` | 否 | `["/"]` | 命令前缀 |
 | `SUPERUSERS` | 否 | `[]` | 超级用户 QQ 号集合 |
+| `TITLE_ADMINS` | 否 | `[]` | 允许设置和删除全局用户称号的 QQ 号列表 |
 | `DATABASE_URL` | 否 | SQLite | 棋类等插件使用的数据库地址 |
 | `BOARDGAME_TIMEOUT` | 否 | `600` | 棋局超时时间，单位为秒 |
 | `MEMES_COMMAND_PREFIXES` | 否 | `["/"]` | Memes 使用独立前缀，避免与 PetPet 指令冲突 |
 
 当前 AI 模型可通过 `.env` 中的 `OPENAI_MODEL` 设置；使用兼容服务时，应填写该服务实际提供的模型名称。
+
+称号管理员可以使用 `/设置称号 QQ号 称号`、`/查看称号 QQ号` 和 `/删除称号 QQ号` 管理全局用户身份。称号数据保存在 `data/user_titles.db`，机器人重启后仍然有效。聊天中提到已登记称号时，机器人会自动识别该称号对应的 QQ。
 
 ### 检查 API 连通性
 
