@@ -9,6 +9,12 @@ from nonebot.exception import FinishedException
 from nonebot.params import CommandArg
 from openai import AsyncOpenAI
 
+from .chat_memory import (
+    build_long_term_memory_prompt,
+    format_messages_for_memory,
+    memory_store,
+    trim_history_for_memory,
+)
 from .user_titles import (
     get_mentioned_title_records,
     get_mentioned_titles_prompt,
@@ -38,6 +44,7 @@ recent_image_signatures = {}  # 群/私聊范围内最近识别过的图片
 
 MAX_HISTORY = 10     # 最多保留10轮对话
 MAX_RECENT_IMAGE_SIGNATURES = 50
+MAX_MEMORY_SOURCE_CHARS = 2500
 
 # 系统提示词（QQ群聊风格）
 SYSTEM_PROMPT = """你正在 QQ 群里自然聊天，不是客服、说明书或搜索引擎。
@@ -492,6 +499,48 @@ def build_user_message_content(
     return content
 
 
+async def update_long_term_memory(
+    session_key,
+    old_summary: str,
+    trimmed_messages: list[dict[str, Any]],
+) -> str:
+    if not client or not trimmed_messages:
+        return old_summary
+
+    source_text = format_messages_for_memory(trimmed_messages)
+    if not source_text:
+        return old_summary
+
+    source_text = source_text[-MAX_MEMORY_SOURCE_CHARS:]
+    response = await client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "你在维护 QQ 机器人长期记忆摘要。"
+                    "只保留对未来聊天有用、相对稳定或近期仍重要的信息："
+                    "用户偏好、称呼方式、正在准备的事项、明确表达的目标、持续状态。"
+                    "删除寒暄、一次性闲聊、表情包反应、已过时细节和不确定猜测。"
+                    "不要编造，不要记录隐私敏感信息。"
+                    "输出不超过 8 条短句；没有值得保留的信息就输出空字符串。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"已有长期记忆：\n{old_summary or '（无）'}\n\n"
+                    f"新增旧对话：\n{source_text}\n\n"
+                    "请合并为新的长期记忆摘要。"
+                ),
+            },
+        ],
+    )
+    new_summary = (response.choices[0].message.content or "").strip()
+    await memory_store.upsert_summary(session_key, new_summary)
+    return new_summary
+
+
 async def process_chat(matcher, bot: Bot, event: MessageEvent):
     if not client:
         await matcher.finish("❌ API 未配置")
@@ -526,6 +575,8 @@ async def process_chat(matcher, bot: Bot, event: MessageEvent):
         system = SYSTEM_PROMPT
         if user_modes.get(session_key) == "roleplay" and session_key in user_roles:
             system = user_roles[session_key]
+        long_term_memory = await memory_store.get_summary(session_key)
+        system += build_long_term_memory_prompt(long_term_memory)
         system += await get_user_title_prompt(user_id, bot, event)
         mentioned_title_records = await get_mentioned_title_records(
             user_msg, bot, event
@@ -557,8 +608,19 @@ async def process_chat(matcher, bot: Bot, event: MessageEvent):
         user_history[session_key].append({"role": "assistant", "content": reply})
 
         # 限制历史长度
-        if len(user_history[session_key]) > MAX_HISTORY * 2:
-            user_history[session_key] = user_history[session_key][-MAX_HISTORY * 2:]
+        user_history[session_key], trimmed_messages = trim_history_for_memory(
+            user_history[session_key],
+            MAX_HISTORY * 2,
+        )
+        if trimmed_messages:
+            try:
+                await update_long_term_memory(
+                    session_key,
+                    long_term_memory,
+                    trimmed_messages,
+                )
+            except Exception as error:
+                logger.opt(exception=True).warning("更新长期记忆失败: {}", error)
 
         logger.info(f"回复: {reply[:80]}...")
         await matcher.finish(
@@ -592,3 +654,8 @@ async def handle_bye(event: MessageEvent):
 async def handle_chat_at(bot: Bot, event: MessageEvent):
     active_users.add(conversation_key(event))
     await process_chat(chat_at, bot, event)
+
+
+@get_driver().on_startup
+async def initialize_chat_memory_store() -> None:
+    await memory_store.initialize()
