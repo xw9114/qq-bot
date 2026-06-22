@@ -8,6 +8,7 @@ nonebot.init()
 
 from nonebot.adapters.onebot.v11 import Message, MessageSegment  # noqa: E402
 
+from plugins.claude_chat import build_user_message_content  # noqa: E402
 from plugins.claude_chat import build_chat_reply_message  # noqa: E402
 from plugins.claude_chat import format_user_message  # noqa: E402
 from plugins.user_titles import UserTitleRecord  # noqa: E402
@@ -61,6 +62,45 @@ class ClaudeChatMessageFormatTest(unittest.TestCase):
         self.assertEqual(
             format_user_message(message),
             "你看 [图片：动画表情] [QQ表情:14] @123456",
+        )
+
+    def test_builds_multimodal_content_for_image_url(self):
+        message = Message(
+            [
+                MessageSegment.text("看看这张图"),
+                MessageSegment(
+                    "image",
+                    {
+                        "summary": "[截图]",
+                        "url": "https://example.com/image.jpg",
+                    },
+                ),
+            ]
+        )
+
+        self.assertEqual(
+            build_user_message_content(message),
+            [
+                {"type": "text", "text": "看看这张图"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.com/image.jpg"},
+                },
+                {"type": "text", "text": "[图片：截图]"},
+            ],
+        )
+
+    def test_image_without_url_falls_back_to_text(self):
+        message = Message(
+            [
+                MessageSegment.text("这个表情"),
+                MessageSegment("image", {"summary": "[动画表情]"}),
+            ]
+        )
+
+        self.assertEqual(
+            build_user_message_content(message),
+            "这个表情 [图片：动画表情]",
         )
 
 

@@ -42,7 +42,7 @@ SYSTEM_PROMPT = """你正在 QQ 群里自然聊天，不是客服、说明书或
 回复要像真实群友：先判断对方是在提问、吐槽、接梗、发图/表情，还是认真求助。
 普通闲聊控制在 1-3 句，口语、松弛，可以轻度吐槽和接梗，但不要硬玩梗、尬夸或说教。
 认真问题直接给可执行答案；信息不足时先指出关键缺口，再给一个最可能的判断。
-你看不到图片真实内容，只能根据消息里的图片说明、表情文字或上下文回应；不要假装看见细节。
+当用户发送图片时，你可以直接观察图片内容；如果图片无法访问，再根据图片说明和上下文说明限制。
 避免模板化开场、频繁感叹号和过量 emoji。"""
 
 # 角色预设
@@ -367,6 +367,14 @@ def describe_non_text_segment(segment: MessageSegment) -> str:
     return f"[{segment_type}消息]"
 
 
+def get_image_url(segment: MessageSegment) -> str | None:
+    if segment.type != "image":
+        return None
+
+    url = str(segment.data.get("url", "")).strip()
+    return url or None
+
+
 def format_user_message(message: Message) -> str:
     """把 OneBot 消息段转成模型可理解的聊天文本。"""
     parts: list[str] = []
@@ -382,6 +390,51 @@ def format_user_message(message: Message) -> str:
     return " ".join(part for part in parts if part).strip()
 
 
+def build_user_message_content(message: Message) -> str | list[dict[str, Any]]:
+    """构造 OpenAI 兼容的多模态用户消息内容。"""
+    content: list[dict[str, Any]] = []
+    text_parts: list[str] = []
+
+    def flush_text_parts() -> None:
+        if not text_parts:
+            return
+        text = " ".join(text_parts).strip()
+        if text:
+            content.append({"type": "text", "text": text})
+        text_parts.clear()
+
+    for segment in message:
+        if segment.type == "text":
+            text = normalize_segment_text(segment.data.get("text", ""))
+            if text:
+                text_parts.append(text)
+            continue
+
+        image_url = get_image_url(segment)
+        if image_url:
+            flush_text_parts()
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_url},
+                }
+            )
+            summary = describe_non_text_segment(segment)
+            if summary != "[图片]":
+                text_parts.append(summary)
+            continue
+
+        text_parts.append(describe_non_text_segment(segment))
+
+    flush_text_parts()
+
+    if not content:
+        return ""
+    if len(content) == 1 and content[0]["type"] == "text":
+        return str(content[0]["text"])
+    return content
+
+
 async def process_chat(matcher, bot: Bot, event: MessageEvent):
     if not client:
         await matcher.finish("❌ API 未配置")
@@ -389,9 +442,11 @@ async def process_chat(matcher, bot: Bot, event: MessageEvent):
 
     user_id = event.user_id
     plain_user_msg = event.get_plaintext().strip()
-    user_msg = format_user_message(event.get_message())
+    event_message = event.get_message()
+    user_msg = format_user_message(event_message)
+    current_user_content = build_user_message_content(event_message)
 
-    if not user_msg:
+    if not user_msg or not current_user_content:
         return
 
     # 处理角色选择
@@ -422,16 +477,20 @@ async def process_chat(matcher, bot: Bot, event: MessageEvent):
         if user_id not in user_history:
             user_history[user_id] = []
 
-        # 添加用户消息到历史
-        user_history[user_id].append({"role": "user", "content": user_msg})
-
-        # 构建完整消息列表
-        messages = [{"role": "system", "content": system}] + user_history[user_id]
+        # 当前轮可携带图片；历史只保留文字摘要，避免旧图片反复进入上下文。
+        messages = (
+            [{"role": "system", "content": system}]
+            + user_history[user_id]
+            + [{"role": "user", "content": current_user_content}]
+        )
 
         response = await client.chat.completions.create(
             model=model_name, messages=messages
         )
         reply = response.choices[0].message.content
+
+        # 保存用户消息摘要到历史
+        user_history[user_id].append({"role": "user", "content": user_msg})
 
         # 保存助手回复到历史
         user_history[user_id].append({"role": "assistant", "content": reply})
