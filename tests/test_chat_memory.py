@@ -79,6 +79,9 @@ class LongTermMemoryStoreTest(unittest.TestCase):
                     await store.get_summary(private_session),
                     "用户私聊喜欢短回复",
                 )
+                self.assertTrue(await store.delete_summary(group_session))
+                self.assertEqual(await store.get_summary(group_session), "")
+                self.assertFalse(await store.delete_summary(group_session))
 
         asyncio.run(run_test())
 

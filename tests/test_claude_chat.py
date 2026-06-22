@@ -10,9 +10,18 @@ from nonebot.adapters.onebot.v11 import Message, MessageSegment  # noqa: E402
 
 from plugins.claude_chat import build_user_message_content  # noqa: E402
 from plugins.claude_chat import build_chat_reply_message  # noqa: E402
+from plugins.claude_chat import cleanup_runtime_state  # noqa: E402
+from plugins.claude_chat import active_users  # noqa: E402
+from plugins.claude_chat import clear_runtime_session_state  # noqa: E402
 from plugins.claude_chat import conversation_key  # noqa: E402
 from plugins.claude_chat import format_user_message  # noqa: E402
+from plugins.claude_chat import image_cache_last_seen  # noqa: E402
+from plugins.claude_chat import quiz_answers  # noqa: E402
 from plugins.claude_chat import recent_image_signatures  # noqa: E402
+from plugins.claude_chat import session_last_seen  # noqa: E402
+from plugins.claude_chat import user_history  # noqa: E402
+from plugins.claude_chat import user_modes  # noqa: E402
+from plugins.claude_chat import user_roles  # noqa: E402
 from plugins.user_titles import UserTitleRecord  # noqa: E402
 
 
@@ -156,6 +165,59 @@ class ClaudeChatSessionKeyTest(unittest.TestCase):
         group_event = SimpleNamespace(user_id=12345, group_id=10000)
 
         self.assertNotEqual(conversation_key(private_event), conversation_key(group_event))
+
+
+class ClaudeChatRuntimeCleanupTest(unittest.TestCase):
+    def tearDown(self):
+        active_users.clear()
+        user_modes.clear()
+        user_roles.clear()
+        quiz_answers.clear()
+        user_history.clear()
+        session_last_seen.clear()
+        recent_image_signatures.clear()
+        image_cache_last_seen.clear()
+
+    def test_clear_runtime_session_state_removes_short_term_state(self):
+        session_key = ("group", 12345, 10000)
+        active_users.add(session_key)
+        user_modes[session_key] = "roleplay"
+        user_roles[session_key] = "role prompt"
+        user_history[session_key] = [{"role": "user", "content": "我要考试了"}]
+        session_last_seen[session_key] = 1.0
+
+        clear_runtime_session_state(session_key)
+
+        self.assertNotIn(session_key, active_users)
+        self.assertNotIn(session_key, user_modes)
+        self.assertNotIn(session_key, user_roles)
+        self.assertNotIn(session_key, user_history)
+        self.assertNotIn(session_key, session_last_seen)
+
+    def test_cleanup_runtime_state_removes_expired_entries(self):
+        expired_session = ("group", 12345, 10000)
+        fresh_session = ("group", 12345, 20000)
+        expired_cache = ("group", 10000)
+        fresh_cache = ("group", 20000)
+
+        active_users.update({expired_session, fresh_session})
+        user_history[expired_session] = [{"role": "user", "content": "旧消息"}]
+        user_history[fresh_session] = [{"role": "user", "content": "新消息"}]
+        session_last_seen[expired_session] = 0.0
+        session_last_seen[fresh_session] = 100000.0
+        recent_image_signatures[expired_cache] = ["old-image"]
+        recent_image_signatures[fresh_cache] = ["new-image"]
+        image_cache_last_seen[expired_cache] = 0.0
+        image_cache_last_seen[fresh_cache] = 100000.0
+
+        expired_sessions, expired_image_caches = cleanup_runtime_state(100000.0)
+
+        self.assertEqual(expired_sessions, 1)
+        self.assertEqual(expired_image_caches, 1)
+        self.assertNotIn(expired_session, active_users)
+        self.assertIn(fresh_session, active_users)
+        self.assertNotIn(expired_cache, recent_image_signatures)
+        self.assertIn(fresh_cache, recent_image_signatures)
 
 
 if __name__ == "__main__":

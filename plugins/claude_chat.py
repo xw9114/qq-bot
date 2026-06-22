@@ -1,3 +1,5 @@
+import asyncio
+import time
 from typing import Any
 
 from nonebot import on_message, on_command, get_driver
@@ -41,10 +43,16 @@ quiz_answers = {}    # 问答答案
 active_users = set() # 已开启对话的会话
 user_history = {}    # 会话对话历史
 recent_image_signatures = {}  # 群/私聊范围内最近识别过的图片
+session_last_seen = {}  # 会话最近活跃时间
+image_cache_last_seen = {}  # 图片缓存最近活跃时间
+runtime_cleanup_task = None
 
 MAX_HISTORY = 10     # 最多保留10轮对话
 MAX_RECENT_IMAGE_SIGNATURES = 50
 MAX_MEMORY_SOURCE_CHARS = 2500
+SESSION_STATE_TTL_SECONDS = 6 * 60 * 60
+IMAGE_CACHE_TTL_SECONDS = 3 * 60 * 60
+RUNTIME_CLEANUP_INTERVAL_SECONDS = 30 * 60
 
 # 系统提示词（QQ群聊风格）
 SYSTEM_PROMPT = """你正在 QQ 群里自然聊天，不是客服、说明书或搜索引擎。
@@ -79,6 +87,53 @@ def image_cache_key(event: MessageEvent) -> tuple[str, int | None]:
     group_id = getattr(event, "group_id", None)
     return ("group", group_id) if group_id is not None else ("private", event.user_id)
 
+
+def touch_session(session_key, now: float | None = None) -> None:
+    session_last_seen[session_key] = now if now is not None else time.monotonic()
+
+
+def clear_runtime_session_state(session_key) -> None:
+    active_users.discard(session_key)
+    user_modes.pop(session_key, None)
+    user_roles.pop(session_key, None)
+    quiz_answers.pop(session_key, None)
+    user_history.pop(session_key, None)
+    session_last_seen.pop(session_key, None)
+
+
+def cleanup_runtime_state(now: float | None = None) -> tuple[int, int]:
+    current_time = now if now is not None else time.monotonic()
+    expired_sessions = [
+        session_key
+        for session_key, last_seen in session_last_seen.items()
+        if current_time - last_seen > SESSION_STATE_TTL_SECONDS
+    ]
+    for session_key in expired_sessions:
+        clear_runtime_session_state(session_key)
+
+    expired_image_caches = [
+        cache_key
+        for cache_key, last_seen in image_cache_last_seen.items()
+        if current_time - last_seen > IMAGE_CACHE_TTL_SECONDS
+    ]
+    for cache_key in expired_image_caches:
+        recent_image_signatures.pop(cache_key, None)
+        image_cache_last_seen.pop(cache_key, None)
+
+    return len(expired_sessions), len(expired_image_caches)
+
+
+async def runtime_cleanup_loop() -> None:
+    while True:
+        await asyncio.sleep(RUNTIME_CLEANUP_INTERVAL_SECONDS)
+        expired_sessions, expired_image_caches = cleanup_runtime_state()
+        if expired_sessions or expired_image_caches:
+            logger.info(
+                "运行期状态清理完成：{} 个会话，{} 个图片缓存",
+                expired_sessions,
+                expired_image_caches,
+            )
+
 @help_cmd.handle()
 async def handle_help(event: MessageEvent):
     msg = """🤖 可用指令一览
@@ -88,6 +143,8 @@ async def handle_help(event: MessageEvent):
   你好         开启对话模式
   再见 / 拜拜  结束对话模式
   （开启后直接发消息即可聊天）
+  /查看记忆    查看当前会话的长期记忆摘要
+  /清除记忆    清除当前会话的长期记忆和短期上下文
 
 ━━━━━━━━━━━━━━━
 🎭 角色扮演
@@ -138,6 +195,30 @@ async def handle_help(event: MessageEvent):
 ━━━━━━━━━━━━━━━
 ❓ /help       显示此帮助"""
     await help_cmd.finish(Message(msg))
+
+
+view_memory_cmd = on_command("查看记忆", priority=3, block=True)
+clear_memory_cmd = on_command("清除记忆", priority=3, block=True)
+
+
+@view_memory_cmd.handle()
+async def handle_view_memory(event: MessageEvent):
+    summary = await memory_store.get_summary(conversation_key(event))
+    if not summary:
+        await view_memory_cmd.finish("当前会话还没有长期记忆。")
+        return
+    await view_memory_cmd.finish(Message(f"当前会话长期记忆：\n{summary}"))
+
+
+@clear_memory_cmd.handle()
+async def handle_clear_memory(event: MessageEvent):
+    session_key = conversation_key(event)
+    deleted = await memory_store.delete_summary(session_key)
+    clear_runtime_session_state(session_key)
+    if deleted:
+        await clear_memory_cmd.finish("✅ 已清除当前会话的长期记忆和短期上下文。")
+        return
+    await clear_memory_cmd.finish("当前会话没有长期记忆；短期上下文已清除。")
 
 # ========== 角色扮演 ==========
 roleplay_cmd = on_command("角色扮演", priority=3, block=True)
@@ -416,6 +497,7 @@ def get_image_signature(segment: MessageSegment) -> str | None:
 
 
 def is_recent_image(cache_key: tuple[str, int | None], signature: str) -> bool:
+    image_cache_last_seen[cache_key] = time.monotonic()
     signatures = recent_image_signatures.setdefault(cache_key, [])
     if signature in signatures:
         return True
@@ -548,6 +630,7 @@ async def process_chat(matcher, bot: Bot, event: MessageEvent):
 
     user_id = event.user_id
     session_key = conversation_key(event)
+    touch_session(session_key)
     plain_user_msg = event.get_plaintext().strip()
     event_message = event.get_message()
     user_msg = format_user_message(event_message)
@@ -634,7 +717,9 @@ async def process_chat(matcher, bot: Bot, event: MessageEvent):
 
 @greet_chat.handle()
 async def handle_greet(bot: Bot, event: MessageEvent):
-    active_users.add(conversation_key(event))
+    session_key = conversation_key(event)
+    active_users.add(session_key)
+    touch_session(session_key)
     await process_chat(greet_chat, bot, event)
 
 @active_chat.handle()
@@ -644,18 +729,34 @@ async def handle_active(bot: Bot, event: MessageEvent):
 @bye_chat.handle()
 async def handle_bye(event: MessageEvent):
     session_key = conversation_key(event)
-    active_users.discard(session_key)
-    user_modes.pop(session_key, None)
-    user_roles.pop(session_key, None)
-    user_history.pop(session_key, None)
+    clear_runtime_session_state(session_key)
     await bye_chat.finish("👋 再见！有需要随时说'你好'找我")
 
 @chat_at.handle()
 async def handle_chat_at(bot: Bot, event: MessageEvent):
-    active_users.add(conversation_key(event))
+    session_key = conversation_key(event)
+    active_users.add(session_key)
+    touch_session(session_key)
     await process_chat(chat_at, bot, event)
 
 
 @get_driver().on_startup
 async def initialize_chat_memory_store() -> None:
     await memory_store.initialize()
+    global runtime_cleanup_task
+    if runtime_cleanup_task is None or runtime_cleanup_task.done():
+        runtime_cleanup_task = asyncio.create_task(
+            runtime_cleanup_loop(),
+            name="chat-runtime-cleanup",
+        )
+
+
+@get_driver().on_shutdown
+async def shutdown_runtime_cleanup() -> None:
+    if runtime_cleanup_task is None:
+        return
+    runtime_cleanup_task.cancel()
+    try:
+        await runtime_cleanup_task
+    except asyncio.CancelledError:
+        pass

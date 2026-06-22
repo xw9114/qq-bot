@@ -94,6 +94,22 @@ class LongTermMemoryStore:
         await self.initialize()
         await asyncio.to_thread(self._upsert_summary, session_key, summary)
 
+    def _delete_summary(self, session_key: SessionKey) -> bool:
+        with closing(self._connect()) as connection:
+            with connection:
+                cursor = connection.execute(
+                    """
+                    DELETE FROM chat_memory
+                    WHERE scope_type = ? AND user_id = ? AND group_id = ?
+                    """,
+                    self._row_key(session_key),
+                )
+        return cursor.rowcount > 0
+
+    async def delete_summary(self, session_key: SessionKey) -> bool:
+        await self.initialize()
+        return await asyncio.to_thread(self._delete_summary, session_key)
+
 
 memory_store = LongTermMemoryStore(DATABASE_PATH)
 
