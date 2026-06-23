@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,27 +47,28 @@ class UserTitleStore:
 
     def _initialize(self) -> None:
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as connection:
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS user_titles (
-                    user_id INTEGER PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    display_name TEXT,
-                    updated_by INTEGER NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            columns = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(user_titles)")
-            }
-            if "display_name" not in columns:
+        with closing(self._connect()) as connection:
+            with connection:
+                connection.execute("PRAGMA journal_mode = WAL")
                 connection.execute(
-                    "ALTER TABLE user_titles ADD COLUMN display_name TEXT"
+                    """
+                    CREATE TABLE IF NOT EXISTS user_titles (
+                        user_id INTEGER PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        display_name TEXT,
+                        updated_by INTEGER NOT NULL,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
                 )
+                columns = {
+                    str(row["name"])
+                    for row in connection.execute("PRAGMA table_info(user_titles)")
+                }
+                if "display_name" not in columns:
+                    connection.execute(
+                        "ALTER TABLE user_titles ADD COLUMN display_name TEXT"
+                    )
 
     async def initialize(self) -> None:
         if self._initialized:
@@ -86,7 +88,7 @@ class UserTitleStore:
         )
 
     def _get_record(self, user_id: int) -> UserTitleRecord | None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             row = connection.execute(
                 "SELECT user_id, title, display_name FROM user_titles WHERE user_id = ?",
                 (user_id,),
@@ -102,7 +104,7 @@ class UserTitleStore:
         return record.title if record else None
 
     def _find_titles_in_text(self, text: str, limit: int) -> list[UserTitleRecord]:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             rows = connection.execute(
                 """
                 SELECT user_id, title, display_name
@@ -135,24 +137,25 @@ class UserTitleStore:
         display_name: str | None,
     ) -> None:
         updated_at = datetime.now(timezone.utc).isoformat()
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO user_titles (
-                    user_id, title, display_name, updated_by, updated_at
+        with closing(self._connect()) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    INSERT INTO user_titles (
+                        user_id, title, display_name, updated_by, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        title = excluded.title,
+                        display_name = COALESCE(
+                            excluded.display_name,
+                            user_titles.display_name
+                        ),
+                        updated_by = excluded.updated_by,
+                        updated_at = excluded.updated_at
+                    """,
+                    (user_id, title, display_name, updated_by, updated_at),
                 )
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    title = excluded.title,
-                    display_name = COALESCE(
-                        excluded.display_name,
-                        user_titles.display_name
-                    ),
-                    updated_by = excluded.updated_by,
-                    updated_at = excluded.updated_at
-                """,
-                (user_id, title, display_name, updated_by, updated_at),
-            )
 
     async def set_title(
         self,
@@ -172,25 +175,27 @@ class UserTitleStore:
 
     def _set_display_name(self, user_id: int, display_name: str) -> None:
         updated_at = datetime.now(timezone.utc).isoformat()
-        with self._connect() as connection:
-            connection.execute(
-                """
-                UPDATE user_titles
-                SET display_name = ?, updated_at = ?
-                WHERE user_id = ?
-                """,
-                (display_name, updated_at, user_id),
-            )
+        with closing(self._connect()) as connection:
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE user_titles
+                    SET display_name = ?, updated_at = ?
+                    WHERE user_id = ?
+                    """,
+                    (display_name, updated_at, user_id),
+                )
 
     async def set_display_name(self, user_id: int, display_name: str) -> None:
         await self.initialize()
         await asyncio.to_thread(self._set_display_name, user_id, display_name)
 
     def _delete_title(self, user_id: int) -> bool:
-        with self._connect() as connection:
-            cursor = connection.execute(
-                "DELETE FROM user_titles WHERE user_id = ?", (user_id,)
-            )
+        with closing(self._connect()) as connection:
+            with connection:
+                cursor = connection.execute(
+                    "DELETE FROM user_titles WHERE user_id = ?", (user_id,)
+                )
         return cursor.rowcount > 0
 
     async def delete_title(self, user_id: int) -> bool:

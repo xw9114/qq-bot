@@ -1,5 +1,5 @@
 import asyncio
-import sqlite3
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -20,22 +20,13 @@ from plugins.user_titles import (  # noqa: E402
 )
 
 
-class InMemoryUserTitleStore(UserTitleStore):
-    def __init__(self):
-        super().__init__(Path(":memory:"))
-        self.connection = sqlite3.connect(":memory:", check_same_thread=False)
-        self.connection.row_factory = sqlite3.Row
-
-    def _connect(self) -> sqlite3.Connection:
-        return self.connection
-
-
 class UserTitleStoreTest(unittest.TestCase):
     def setUp(self):
-        self.store = InMemoryUserTitleStore()
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.store = UserTitleStore(Path(self.temp_dir.name) / "user_titles.db")
 
     def tearDown(self):
-        self.store.connection.close()
+        self.temp_dir.cleanup()
 
     def test_title_lifecycle(self):
         async def run_test():
@@ -94,7 +85,8 @@ class UserTitleParsingTest(unittest.TestCase):
 
     def test_mentioned_titles_prompt(self):
         original_store = title_store
-        store = InMemoryUserTitleStore()
+        temp_dir = tempfile.TemporaryDirectory()
+        store = UserTitleStore(Path(temp_dir.name) / "user_titles.db")
 
         async def run_test():
             import plugins.user_titles as user_titles
@@ -114,7 +106,7 @@ class UserTitleParsingTest(unittest.TestCase):
                 self.assertNotIn("对应 QQ", prompt)
             finally:
                 user_titles.title_store = original_store
-                store.connection.close()
+                temp_dir.cleanup()
 
         asyncio.run(run_test())
 

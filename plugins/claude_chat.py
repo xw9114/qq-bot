@@ -42,6 +42,7 @@ user_roles = {}      # 角色扮演设定
 quiz_answers = {}    # 问答答案
 active_users = set() # 已开启对话的会话
 user_history = {}    # 会话对话历史
+session_locks = {}   # 会话串行锁，避免同一会话并发写乱历史
 recent_image_signatures = {}  # 群/私聊范围内最近识别过的图片
 session_last_seen = {}  # 会话最近活跃时间
 image_cache_last_seen = {}  # 图片缓存最近活跃时间
@@ -109,6 +110,42 @@ def build_style_prompt(session_key) -> str:
     )
 
 
+def get_session_lock(session_key) -> asyncio.Lock:
+    lock = session_locks.get(session_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        session_locks[session_key] = lock
+    return lock
+
+
+def drop_idle_session_lock(session_key) -> None:
+    lock = session_locks.get(session_key)
+    if lock is not None and not lock.locked():
+        session_locks.pop(session_key, None)
+
+
+def has_runtime_session_state(session_key) -> bool:
+    return (
+        session_key in active_users
+        or session_key in user_modes
+        or session_key in user_roles
+        or session_key in quiz_answers
+        or session_key in user_history
+        or session_key in session_last_seen
+    )
+
+
+def cleanup_idle_session_locks() -> int:
+    idle_locks = [
+        session_key
+        for session_key, lock in session_locks.items()
+        if not lock.locked() and not has_runtime_session_state(session_key)
+    ]
+    for session_key in idle_locks:
+        session_locks.pop(session_key, None)
+    return len(idle_locks)
+
+
 def touch_session(session_key, now: float | None = None) -> None:
     session_last_seen[session_key] = now if now is not None else time.monotonic()
 
@@ -120,6 +157,7 @@ def clear_runtime_session_state(session_key) -> None:
     quiz_answers.pop(session_key, None)
     user_history.pop(session_key, None)
     session_last_seen.pop(session_key, None)
+    drop_idle_session_lock(session_key)
 
 
 def cleanup_runtime_state(now: float | None = None) -> tuple[int, int]:
@@ -141,6 +179,7 @@ def cleanup_runtime_state(now: float | None = None) -> tuple[int, int]:
         recent_image_signatures.pop(cache_key, None)
         image_cache_last_seen.pop(cache_key, None)
 
+    cleanup_idle_session_locks()
     return len(expired_sessions), len(expired_image_caches)
 
 
@@ -234,8 +273,9 @@ async def handle_view_memory(event: MessageEvent):
 @clear_memory_cmd.handle()
 async def handle_clear_memory(event: MessageEvent):
     session_key = conversation_key(event)
-    deleted = await memory_store.delete_summary(session_key)
-    clear_runtime_session_state(session_key)
+    async with get_session_lock(session_key):
+        deleted = await memory_store.delete_summary(session_key)
+        clear_runtime_session_state(session_key)
     if deleted:
         await clear_memory_cmd.finish("✅ 已清除当前会话的长期记忆和短期上下文。")
         return
@@ -272,8 +312,10 @@ async def handle_quiz(event: MessageEvent):
             model=model_name,
             messages=[{"role": "user", "content": "出一道有趣的知识问答题，格式：\n题目：xxx\n答案：xxx\n只输出这两行"}]
         )
-        text = response.choices[0].message.content
-        lines = text.strip().split("\n")
+        text = extract_model_text(response)
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if len(lines) < 2:
+            raise ValueError("模型出题格式不完整")
         question = lines[0].replace("题目：", "").strip()
         answer = lines[1].replace("答案：", "").strip()
         session_key = conversation_key(event)
@@ -302,7 +344,7 @@ async def handle_answer(event: MessageEvent, args: Message = CommandArg()):
             model=model_name,
             messages=[{"role": "user", "content": f"正确答案'{quiz_answers[session_key]}'，用户答'{user_answer}'，只回复：✅ 回答正确！或 ❌ 错误，答案是xxx"}]
         )
-        result = response.choices[0].message.content
+        result = extract_model_text(response, "❌ 判题失败，请重试")
         user_modes.pop(session_key, None)
         quiz_answers.pop(session_key, None)
         await answer_cmd.finish(Message(f"{result}\n\n发送 /问答 继续"))
@@ -341,7 +383,8 @@ async def handle_tarot(event: MessageEvent):
             model=model_name,
             messages=[{"role": "user", "content": f"塔罗牌【{card}】{position}，神秘语气解读，50字以内"}]
         )
-        await tarot_cmd.finish(Message(f"🎴【{card}】{position}\n\n{response.choices[0].message.content}"))
+        text = extract_model_text(response, "这张牌先卖个关子，晚点再抽一次。")
+        await tarot_cmd.finish(Message(f"🎴【{card}】{position}\n\n{text}"))
     except FinishedException:
         pass
     except Exception as e:
@@ -360,7 +403,8 @@ async def handle_joke(event: MessageEvent):
             model=model_name,
             messages=[{"role": "user", "content": "讲一个简短笑话，有反转结尾，不超过80字"}]
         )
-        await joke_cmd.finish(Message(f"😄 {response.choices[0].message.content}"))
+        text = extract_model_text(response, "笑话卡住了，像冷场本人。")
+        await joke_cmd.finish(Message(f"😄 {text}"))
     except FinishedException:
         pass
     except Exception as e:
@@ -602,6 +646,14 @@ def build_user_message_content(
     return content
 
 
+def extract_model_text(response: Any, fallback: str = "") -> str:
+    try:
+        content = response.choices[0].message.content
+    except (AttributeError, IndexError, TypeError):
+        return fallback
+    return str(content).strip() if content else fallback
+
+
 async def update_long_term_memory(
     session_key,
     old_summary: str,
@@ -639,7 +691,7 @@ async def update_long_term_memory(
             },
         ],
     )
-    new_summary = (response.choices[0].message.content or "").strip()
+    new_summary = extract_model_text(response)
     await memory_store.upsert_summary(session_key, new_summary)
     return new_summary
 
@@ -649,8 +701,13 @@ async def process_chat(matcher, bot: Bot, event: MessageEvent):
         await matcher.finish("❌ API 未配置")
         return
 
-    user_id = event.user_id
     session_key = conversation_key(event)
+    async with get_session_lock(session_key):
+        await process_chat_locked(matcher, bot, event, session_key)
+
+
+async def process_chat_locked(matcher, bot: Bot, event: MessageEvent, session_key):
+    user_id = event.user_id
     touch_session(session_key)
     plain_user_msg = event.get_plaintext().strip()
     event_message = event.get_message()
@@ -701,7 +758,7 @@ async def process_chat(matcher, bot: Bot, event: MessageEvent):
         response = await client.chat.completions.create(
             model=model_name, messages=messages
         )
-        reply = response.choices[0].message.content
+        reply = extract_model_text(response, "刚刚脑子卡了一下，你再说一遍。")
 
         # 保存用户消息摘要到历史
         user_history[session_key].append({"role": "user", "content": user_msg})
@@ -748,7 +805,8 @@ async def handle_active(bot: Bot, event: MessageEvent):
 @bye_chat.handle()
 async def handle_bye(event: MessageEvent):
     session_key = conversation_key(event)
-    clear_runtime_session_state(session_key)
+    async with get_session_lock(session_key):
+        clear_runtime_session_state(session_key)
     await bye_chat.finish("👋 再见！有需要随时说'你好'找我")
 
 @chat_at.handle()

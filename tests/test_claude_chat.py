@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 
@@ -16,10 +17,13 @@ from plugins.claude_chat import cleanup_runtime_state  # noqa: E402
 from plugins.claude_chat import active_users  # noqa: E402
 from plugins.claude_chat import clear_runtime_session_state  # noqa: E402
 from plugins.claude_chat import conversation_key  # noqa: E402
+from plugins.claude_chat import extract_model_text  # noqa: E402
 from plugins.claude_chat import format_user_message  # noqa: E402
+from plugins.claude_chat import get_session_lock  # noqa: E402
 from plugins.claude_chat import image_cache_last_seen  # noqa: E402
 from plugins.claude_chat import quiz_answers  # noqa: E402
 from plugins.claude_chat import recent_image_signatures  # noqa: E402
+from plugins.claude_chat import session_locks  # noqa: E402
 from plugins.claude_chat import session_last_seen  # noqa: E402
 from plugins.claude_chat import user_history  # noqa: E402
 from plugins.claude_chat import user_modes  # noqa: E402
@@ -152,6 +156,23 @@ class ClaudeChatMessageFormatTest(unittest.TestCase):
         )
 
 
+class ClaudeChatModelTextTest(unittest.TestCase):
+    def test_extract_model_text_strips_content(self):
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="  好的  "))]
+        )
+
+        self.assertEqual(extract_model_text(response, "兜底"), "好的")
+
+    def test_extract_model_text_uses_fallback_for_empty_or_malformed_response(self):
+        empty_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=None))]
+        )
+
+        self.assertEqual(extract_model_text(empty_response, "兜底"), "兜底")
+        self.assertEqual(extract_model_text(SimpleNamespace(choices=[]), "兜底"), "兜底")
+
+
 class ClaudeChatSessionKeyTest(unittest.TestCase):
     def test_group_sessions_are_isolated_by_group_id(self):
         first_group_event = SimpleNamespace(user_id=12345, group_id=10000)
@@ -199,6 +220,7 @@ class ClaudeChatRuntimeCleanupTest(unittest.TestCase):
         user_roles.clear()
         quiz_answers.clear()
         user_history.clear()
+        session_locks.clear()
         session_last_seen.clear()
         recent_image_signatures.clear()
         image_cache_last_seen.clear()
@@ -243,6 +265,34 @@ class ClaudeChatRuntimeCleanupTest(unittest.TestCase):
         self.assertIn(fresh_session, active_users)
         self.assertNotIn(expired_cache, recent_image_signatures)
         self.assertIn(fresh_cache, recent_image_signatures)
+
+    def test_session_lock_is_reused_and_cleaned_when_idle(self):
+        session_key = ("group", 12345, 10000)
+
+        first_lock = get_session_lock(session_key)
+        second_lock = get_session_lock(session_key)
+        session_last_seen[session_key] = 0.0
+
+        expired_sessions, _ = cleanup_runtime_state(100000.0)
+
+        self.assertIs(first_lock, second_lock)
+        self.assertEqual(expired_sessions, 1)
+        self.assertNotIn(session_key, session_locks)
+
+    def test_locked_session_lock_survives_cleanup(self):
+        async def run_test():
+            session_key = ("group", 12345, 10000)
+            lock = get_session_lock(session_key)
+            session_last_seen[session_key] = 0.0
+
+            async with lock:
+                cleanup_runtime_state(100000.0)
+
+            self.assertIn(session_key, session_locks)
+            cleanup_runtime_state(100001.0)
+            self.assertNotIn(session_key, session_locks)
+
+        asyncio.run(run_test())
 
 
 if __name__ == "__main__":
