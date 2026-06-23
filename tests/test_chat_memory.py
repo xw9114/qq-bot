@@ -46,15 +46,16 @@ class ChatMemoryHelperTest(unittest.TestCase):
             "用户消息 1",
         ])
 
-    def test_formats_messages_for_memory(self):
+    def test_formats_user_messages_for_memory(self):
         text = format_messages_for_memory(
             [
                 {"role": "user", "content": "我要考试了"},
                 {"role": "assistant", "content": "那先别熬夜"},
+                {"role": "user", "content": "我喜欢短回复"},
             ]
         )
 
-        self.assertEqual(text, "用户: 我要考试了\n机器人: 那先别熬夜")
+        self.assertEqual(text, "用户: 我要考试了\n用户: 我喜欢短回复")
 
 
 class LongTermMemoryStoreTest(unittest.TestCase):

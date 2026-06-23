@@ -152,12 +152,13 @@ def trim_history_for_memory(
 def format_messages_for_memory(messages: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     for message in messages:
-        role = "用户" if message.get("role") == "user" else "机器人"
+        if message.get("role") != "user":
+            continue
         content = message.get("content", "")
         if isinstance(content, str):
             text = content.strip()
         else:
             text = str(content).strip()
         if text:
-            lines.append(f"{role}: {text}")
+            lines.append(f"用户: {text}")
     return "\n".join(lines)

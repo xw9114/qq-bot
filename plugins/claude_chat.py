@@ -43,6 +43,10 @@ quiz_answers = {}    # 问答答案
 active_users = set() # 已开启对话的会话
 user_history = {}    # 会话对话历史
 session_locks = {}   # 会话串行锁，避免同一会话并发写乱历史
+memory_update_locks = {}  # 长期记忆后台更新锁
+memory_update_tasks = set()  # 正在运行的长期记忆后台任务
+memory_update_task_counts = {}  # 每会话待处理长期记忆任务数
+memory_update_generations = {}  # 清除记忆后阻止旧后台任务回写
 recent_image_signatures = {}  # 群/私聊范围内最近识别过的图片
 session_last_seen = {}  # 会话最近活跃时间
 image_cache_last_seen = {}  # 图片缓存最近活跃时间
@@ -118,6 +122,14 @@ def get_session_lock(session_key) -> asyncio.Lock:
     return lock
 
 
+def get_memory_update_lock(session_key) -> asyncio.Lock:
+    lock = memory_update_locks.get(session_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        memory_update_locks[session_key] = lock
+    return lock
+
+
 def drop_idle_session_lock(session_key) -> None:
     lock = session_locks.get(session_key)
     if lock is not None and not lock.locked():
@@ -144,6 +156,65 @@ def cleanup_idle_session_locks() -> int:
     for session_key in idle_locks:
         session_locks.pop(session_key, None)
     return len(idle_locks)
+
+
+def bump_memory_update_generation(session_key) -> None:
+    memory_update_generations[session_key] = (
+        memory_update_generations.get(session_key, 0) + 1
+    )
+
+
+def drop_idle_memory_update_state(session_key) -> None:
+    if memory_update_task_counts.get(session_key, 0) > 0:
+        return
+
+    lock = memory_update_locks.get(session_key)
+    if lock is not None and not lock.locked():
+        memory_update_locks.pop(session_key, None)
+    if not has_runtime_session_state(session_key):
+        memory_update_generations.pop(session_key, None)
+
+
+def finish_memory_update_task(session_key, task: asyncio.Task) -> None:
+    memory_update_tasks.discard(task)
+    task_count = memory_update_task_counts.get(session_key, 0) - 1
+    if task_count > 0:
+        memory_update_task_counts[session_key] = task_count
+        return
+
+    memory_update_task_counts.pop(session_key, None)
+    drop_idle_memory_update_state(session_key)
+
+
+def schedule_long_term_memory_update(
+    session_key,
+    trimmed_messages: list[dict[str, Any]],
+) -> None:
+    if not trimmed_messages:
+        return
+
+    generation = memory_update_generations.get(session_key, 0)
+    memory_update_task_counts[session_key] = (
+        memory_update_task_counts.get(session_key, 0) + 1
+    )
+    task = asyncio.create_task(
+        update_long_term_memory_safely(session_key, trimmed_messages, generation),
+        name="chat-long-term-memory-update",
+    )
+    memory_update_tasks.add(task)
+    task.add_done_callback(
+        lambda completed_task: finish_memory_update_task(session_key, completed_task)
+    )
+
+
+async def cancel_memory_update_tasks() -> None:
+    if not memory_update_tasks:
+        return
+
+    tasks = list(memory_update_tasks)
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def touch_session(session_key, now: float | None = None) -> None:
@@ -274,8 +345,11 @@ async def handle_view_memory(event: MessageEvent):
 async def handle_clear_memory(event: MessageEvent):
     session_key = conversation_key(event)
     async with get_session_lock(session_key):
-        deleted = await memory_store.delete_summary(session_key)
+        bump_memory_update_generation(session_key)
+        async with get_memory_update_lock(session_key):
+            deleted = await memory_store.delete_summary(session_key)
         clear_runtime_session_state(session_key)
+        drop_idle_memory_update_state(session_key)
     if deleted:
         await clear_memory_cmd.finish("✅ 已清除当前会话的长期记忆和短期上下文。")
         return
@@ -654,8 +728,7 @@ def extract_model_text(response: Any, fallback: str = "") -> str:
     return str(content).strip() if content else fallback
 
 
-async def update_long_term_memory(
-    session_key,
+async def summarize_long_term_memory(
     old_summary: str,
     trimmed_messages: list[dict[str, Any]],
 ) -> str:
@@ -674,8 +747,10 @@ async def update_long_term_memory(
                 "role": "system",
                 "content": (
                     "你在维护 QQ 机器人长期记忆摘要。"
+                    "新增旧消息只包含用户发言，不包含机器人回复。"
                     "只保留对未来聊天有用、相对稳定或近期仍重要的信息："
                     "用户偏好、称呼方式、正在准备的事项、明确表达的目标、持续状态。"
+                    "不要把机器人之前的回答当成用户事实。"
                     "删除寒暄、一次性闲聊、表情包反应、已过时细节和不确定猜测。"
                     "不要编造，不要记录隐私敏感信息。"
                     "输出不超过 8 条短句；没有值得保留的信息就输出空字符串。"
@@ -692,8 +767,42 @@ async def update_long_term_memory(
         ],
     )
     new_summary = extract_model_text(response)
+    return new_summary
+
+
+async def update_long_term_memory(
+    session_key,
+    old_summary: str,
+    trimmed_messages: list[dict[str, Any]],
+) -> str:
+    new_summary = await summarize_long_term_memory(old_summary, trimmed_messages)
     await memory_store.upsert_summary(session_key, new_summary)
     return new_summary
+
+
+async def update_long_term_memory_safely(
+    session_key,
+    trimmed_messages: list[dict[str, Any]],
+    generation: int,
+) -> None:
+    try:
+        async with get_memory_update_lock(session_key):
+            if generation != memory_update_generations.get(session_key, 0):
+                return
+
+            current_summary = await memory_store.get_summary(session_key)
+            new_summary = await summarize_long_term_memory(
+                current_summary,
+                trimmed_messages,
+            )
+            if generation != memory_update_generations.get(session_key, 0):
+                return
+
+            await memory_store.upsert_summary(session_key, new_summary)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logger.opt(exception=True).warning("更新长期记忆失败: {}", error)
 
 
 async def process_chat(matcher, bot: Bot, event: MessageEvent):
@@ -771,15 +880,7 @@ async def process_chat_locked(matcher, bot: Bot, event: MessageEvent, session_ke
             user_history[session_key],
             MAX_HISTORY * 2,
         )
-        if trimmed_messages:
-            try:
-                await update_long_term_memory(
-                    session_key,
-                    long_term_memory,
-                    trimmed_messages,
-                )
-            except Exception as error:
-                logger.opt(exception=True).warning("更新长期记忆失败: {}", error)
+        schedule_long_term_memory_update(session_key, trimmed_messages)
 
         logger.info(f"回复: {reply[:80]}...")
         await matcher.finish(
@@ -830,6 +931,7 @@ async def initialize_chat_memory_store() -> None:
 
 @get_driver().on_shutdown
 async def shutdown_runtime_cleanup() -> None:
+    await cancel_memory_update_tasks()
     if runtime_cleanup_task is None:
         return
     runtime_cleanup_task.cancel()

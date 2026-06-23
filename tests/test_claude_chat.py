@@ -9,6 +9,7 @@ nonebot.init()
 
 from nonebot.adapters.onebot.v11 import Message, MessageSegment  # noqa: E402
 
+import plugins.claude_chat as claude_chat  # noqa: E402
 from plugins.claude_chat import SYSTEM_PROMPT  # noqa: E402
 from plugins.claude_chat import build_user_message_content  # noqa: E402
 from plugins.claude_chat import build_chat_reply_message  # noqa: E402
@@ -21,10 +22,16 @@ from plugins.claude_chat import extract_model_text  # noqa: E402
 from plugins.claude_chat import format_user_message  # noqa: E402
 from plugins.claude_chat import get_session_lock  # noqa: E402
 from plugins.claude_chat import image_cache_last_seen  # noqa: E402
+from plugins.claude_chat import memory_update_generations  # noqa: E402
+from plugins.claude_chat import memory_update_locks  # noqa: E402
+from plugins.claude_chat import memory_update_task_counts  # noqa: E402
+from plugins.claude_chat import memory_update_tasks  # noqa: E402
 from plugins.claude_chat import quiz_answers  # noqa: E402
 from plugins.claude_chat import recent_image_signatures  # noqa: E402
+from plugins.claude_chat import schedule_long_term_memory_update  # noqa: E402
 from plugins.claude_chat import session_locks  # noqa: E402
 from plugins.claude_chat import session_last_seen  # noqa: E402
+from plugins.claude_chat import update_long_term_memory_safely  # noqa: E402
 from plugins.claude_chat import user_history  # noqa: E402
 from plugins.claude_chat import user_modes  # noqa: E402
 from plugins.claude_chat import user_roles  # noqa: E402
@@ -291,6 +298,76 @@ class ClaudeChatRuntimeCleanupTest(unittest.TestCase):
             self.assertIn(session_key, session_locks)
             cleanup_runtime_state(100001.0)
             self.assertNotIn(session_key, session_locks)
+
+        asyncio.run(run_test())
+
+
+class ClaudeChatMemoryUpdateTest(unittest.TestCase):
+    def tearDown(self):
+        memory_update_generations.clear()
+        memory_update_locks.clear()
+        memory_update_task_counts.clear()
+        memory_update_tasks.clear()
+
+    def test_schedule_long_term_memory_update_tracks_and_cleans_task(self):
+        async def run_test():
+            session_key = ("group", 12345, 10000)
+            trimmed_messages = [{"role": "user", "content": "我要考试了"}]
+            calls = []
+            original_update = claude_chat.update_long_term_memory_safely
+
+            async def fake_update(session_key_arg, messages_arg, generation_arg):
+                calls.append((session_key_arg, messages_arg, generation_arg))
+
+            claude_chat.update_long_term_memory_safely = fake_update
+            try:
+                schedule_long_term_memory_update(session_key, trimmed_messages)
+                self.assertEqual(memory_update_task_counts[session_key], 1)
+
+                await asyncio.gather(*list(memory_update_tasks))
+
+                self.assertEqual(calls, [(session_key, trimmed_messages, 0)])
+                self.assertNotIn(session_key, memory_update_task_counts)
+            finally:
+                claude_chat.update_long_term_memory_safely = original_update
+
+        asyncio.run(run_test())
+
+    def test_memory_generation_change_skips_stale_background_write(self):
+        class FakeMemoryStore:
+            def __init__(self):
+                self.writes = []
+
+            async def get_summary(self, session_key):
+                return "旧摘要"
+
+            async def upsert_summary(self, session_key, summary):
+                self.writes.append((session_key, summary))
+
+        async def run_test():
+            session_key = ("group", 12345, 10000)
+            store = FakeMemoryStore()
+            original_store = claude_chat.memory_store
+            original_summarize = claude_chat.summarize_long_term_memory
+
+            async def fake_summarize(old_summary, trimmed_messages):
+                memory_update_generations[session_key] = 2
+                return "新摘要"
+
+            claude_chat.memory_store = store
+            claude_chat.summarize_long_term_memory = fake_summarize
+            memory_update_generations[session_key] = 1
+            try:
+                await update_long_term_memory_safely(
+                    session_key,
+                    [{"role": "user", "content": "我要考试了"}],
+                    1,
+                )
+
+                self.assertEqual(store.writes, [])
+            finally:
+                claude_chat.memory_store = original_store
+                claude_chat.summarize_long_term_memory = original_summarize
 
         asyncio.run(run_test())
 
