@@ -11,13 +11,16 @@ from nonebot.adapters.onebot.v11 import Message, MessageSegment  # noqa: E402
 
 import plugins.claude_chat as claude_chat  # noqa: E402
 from plugins.claude_chat import SYSTEM_PROMPT  # noqa: E402
+from plugins.claude_chat import active_rule  # noqa: E402
 from plugins.claude_chat import build_user_message_content  # noqa: E402
 from plugins.claude_chat import build_chat_reply_message  # noqa: E402
 from plugins.claude_chat import build_style_prompt  # noqa: E402
+from plugins.claude_chat import clear_quiz_state  # noqa: E402
 from plugins.claude_chat import cleanup_runtime_state  # noqa: E402
 from plugins.claude_chat import active_users  # noqa: E402
 from plugins.claude_chat import clear_runtime_session_state  # noqa: E402
 from plugins.claude_chat import conversation_key  # noqa: E402
+from plugins.claude_chat import exit_roleplay_state  # noqa: E402
 from plugins.claude_chat import extract_model_text  # noqa: E402
 from plugins.claude_chat import format_user_message  # noqa: E402
 from plugins.claude_chat import get_session_lock  # noqa: E402
@@ -31,6 +34,8 @@ from plugins.claude_chat import recent_image_signatures  # noqa: E402
 from plugins.claude_chat import schedule_long_term_memory_update  # noqa: E402
 from plugins.claude_chat import session_locks  # noqa: E402
 from plugins.claude_chat import session_last_seen  # noqa: E402
+from plugins.claude_chat import start_quiz_state  # noqa: E402
+from plugins.claude_chat import start_role_selection  # noqa: E402
 from plugins.claude_chat import update_long_term_memory_safely  # noqa: E402
 from plugins.claude_chat import user_history  # noqa: E402
 from plugins.claude_chat import user_modes  # noqa: E402
@@ -218,6 +223,57 @@ class ClaudeChatPromptTest(unittest.TestCase):
         self.assertIn(SYSTEM_PROMPT, prompt)
         self.assertIn("当前角色设定：说话像古代谋士", prompt)
         self.assertIn("只影响口吻", prompt)
+
+
+class ClaudeChatStateTransitionTest(unittest.TestCase):
+    def tearDown(self):
+        active_users.clear()
+        user_modes.clear()
+        user_roles.clear()
+        quiz_answers.clear()
+        session_last_seen.clear()
+
+    def test_role_selection_activates_session_for_numeric_reply(self):
+        event = SimpleNamespace(
+            user_id=12345,
+            group_id=10000,
+            get_plaintext=lambda: "1",
+        )
+        session_key = conversation_key(event)
+
+        start_role_selection(session_key)
+
+        self.assertIn(session_key, active_users)
+        self.assertEqual(user_modes[session_key], "selecting_role")
+        self.assertTrue(asyncio.run(active_rule(event)))
+
+    def test_exit_roleplay_state_keeps_chat_active_but_clears_role(self):
+        session_key = ("group", 12345, 10000)
+        active_users.add(session_key)
+        user_modes[session_key] = "roleplay"
+        user_roles[session_key] = "role prompt"
+
+        exit_roleplay_state(session_key)
+
+        self.assertIn(session_key, active_users)
+        self.assertNotIn(session_key, user_modes)
+        self.assertNotIn(session_key, user_roles)
+        self.assertIn(session_key, session_last_seen)
+
+    def test_quiz_state_lifecycle(self):
+        session_key = ("group", 12345, 10000)
+
+        start_quiz_state(session_key, "正确答案")
+
+        self.assertEqual(user_modes[session_key], "quiz")
+        self.assertEqual(quiz_answers[session_key], "正确答案")
+        self.assertIn(session_key, session_last_seen)
+
+        clear_quiz_state(session_key)
+
+        self.assertNotIn(session_key, user_modes)
+        self.assertNotIn(session_key, quiz_answers)
+        self.assertIn(session_key, session_last_seen)
 
 
 class ClaudeChatRuntimeCleanupTest(unittest.TestCase):

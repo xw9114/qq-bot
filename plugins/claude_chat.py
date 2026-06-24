@@ -231,6 +231,30 @@ def clear_runtime_session_state(session_key) -> None:
     drop_idle_session_lock(session_key)
 
 
+def start_role_selection(session_key) -> None:
+    active_users.add(session_key)
+    user_modes[session_key] = "selecting_role"
+    touch_session(session_key)
+
+
+def exit_roleplay_state(session_key) -> None:
+    user_modes.pop(session_key, None)
+    user_roles.pop(session_key, None)
+    touch_session(session_key)
+
+
+def start_quiz_state(session_key, answer: str) -> None:
+    user_modes[session_key] = "quiz"
+    quiz_answers[session_key] = answer
+    touch_session(session_key)
+
+
+def clear_quiz_state(session_key) -> None:
+    user_modes.pop(session_key, None)
+    quiz_answers.pop(session_key, None)
+    touch_session(session_key)
+
+
 def cleanup_runtime_state(now: float | None = None) -> tuple[int, int]:
     current_time = now if now is not None else time.monotonic()
     expired_sessions = [
@@ -361,7 +385,8 @@ roleplay_cmd = on_command("角色扮演", priority=3, block=True)
 @roleplay_cmd.handle()
 async def handle_roleplay(event: MessageEvent):
     session_key = conversation_key(event)
-    user_modes[session_key] = "selecting_role"
+    async with get_session_lock(session_key):
+        start_role_selection(session_key)
     await roleplay_cmd.finish(Message("🎭 选择角色：\n1️⃣ 侦探柯南\n2️⃣ 猫娘\n3️⃣ 古代谋士\n4️⃣ 毒舌导师\n\n回复数字选择"))
 
 exit_role_cmd = on_command("退出角色", priority=3, block=True)
@@ -369,8 +394,8 @@ exit_role_cmd = on_command("退出角色", priority=3, block=True)
 @exit_role_cmd.handle()
 async def handle_exit_role(event: MessageEvent):
     session_key = conversation_key(event)
-    user_modes.pop(session_key, None)
-    user_roles.pop(session_key, None)
+    async with get_session_lock(session_key):
+        exit_roleplay_state(session_key)
     await exit_role_cmd.finish("✅ 已退出角色扮演")
 
 # ========== 问答竞赛 ==========
@@ -381,21 +406,21 @@ async def handle_quiz(event: MessageEvent):
     if not client:
         await quiz_cmd.finish("❌ API 未配置")
         return
+    session_key = conversation_key(event)
     try:
-        response = await client.chat.completions.create(
-            model=model_name,
-            messages=[{"role": "user", "content": "出一道有趣的知识问答题，格式：\n题目：xxx\n答案：xxx\n只输出这两行"}]
-        )
-        text = extract_model_text(response)
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        if len(lines) < 2:
-            raise ValueError("模型出题格式不完整")
-        question = lines[0].replace("题目：", "").strip()
-        answer = lines[1].replace("答案：", "").strip()
-        session_key = conversation_key(event)
-        user_modes[session_key] = "quiz"
-        quiz_answers[session_key] = answer
-        await quiz_cmd.finish(Message(f"🧠 问答开始！\n\n❓ {question}\n\n用 /答案 [你的答案] 回答"))
+        async with get_session_lock(session_key):
+            response = await client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": "出一道有趣的知识问答题，格式：\n题目：xxx\n答案：xxx\n只输出这两行"}]
+            )
+            text = extract_model_text(response)
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            if len(lines) < 2:
+                raise ValueError("模型出题格式不完整")
+            question = lines[0].replace("题目：", "").strip()
+            answer = lines[1].replace("答案：", "").strip()
+            start_quiz_state(session_key, answer)
+            await quiz_cmd.finish(Message(f"🧠 问答开始！\n\n❓ {question}\n\n用 /答案 [你的答案] 回答"))
     except FinishedException:
         pass
     except Exception as e:
@@ -406,34 +431,37 @@ answer_cmd = on_command("答案", priority=3, block=True)
 @answer_cmd.handle()
 async def handle_answer(event: MessageEvent, args: Message = CommandArg()):
     session_key = conversation_key(event)
-    if user_modes.get(session_key) != "quiz":
-        await answer_cmd.finish("❌ 未开始问答，发送 /问答 开始")
-        return
-    user_answer = args.extract_plain_text().strip()
-    if not user_answer:
-        await answer_cmd.finish("请输入答案：/答案 xxx")
-        return
-    try:
-        response = await client.chat.completions.create(
-            model=model_name,
-            messages=[{"role": "user", "content": f"正确答案'{quiz_answers[session_key]}'，用户答'{user_answer}'，只回复：✅ 回答正确！或 ❌ 错误，答案是xxx"}]
-        )
-        result = extract_model_text(response, "❌ 判题失败，请重试")
-        user_modes.pop(session_key, None)
-        quiz_answers.pop(session_key, None)
-        await answer_cmd.finish(Message(f"{result}\n\n发送 /问答 继续"))
-    except FinishedException:
-        pass
-    except Exception as e:
-        await answer_cmd.finish("❌ 判题失败，请重试")
+    async with get_session_lock(session_key):
+        if user_modes.get(session_key) != "quiz":
+            await answer_cmd.finish("❌ 未开始问答，发送 /问答 开始")
+            return
+        user_answer = args.extract_plain_text().strip()
+        if not user_answer:
+            await answer_cmd.finish("请输入答案：/答案 xxx")
+            return
+        if not client:
+            await answer_cmd.finish("❌ API 未配置")
+            return
+        try:
+            response = await client.chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": f"正确答案'{quiz_answers[session_key]}'，用户答'{user_answer}'，只回复：✅ 回答正确！或 ❌ 错误，答案是xxx"}]
+            )
+            result = extract_model_text(response, "❌ 判题失败，请重试")
+            clear_quiz_state(session_key)
+            await answer_cmd.finish(Message(f"{result}\n\n发送 /问答 继续"))
+        except FinishedException:
+            pass
+        except Exception as e:
+            await answer_cmd.finish("❌ 判题失败，请重试")
 
 exit_quiz_cmd = on_command("退出问答", priority=3, block=True)
 
 @exit_quiz_cmd.handle()
 async def handle_exit_quiz(event: MessageEvent):
     session_key = conversation_key(event)
-    user_modes.pop(session_key, None)
-    quiz_answers.pop(session_key, None)
+    async with get_session_lock(session_key):
+        clear_quiz_state(session_key)
     await exit_quiz_cmd.finish("✅ 已退出问答")
 
 # ========== 塔罗牌占卜 ==========
