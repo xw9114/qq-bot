@@ -103,6 +103,8 @@ class UserTitleParsingTest(unittest.TestCase):
                 self.assertIn("人机", prompt)
                 self.assertIn("何以究得物理", prompt)
                 self.assertIn("调侃或评价", prompt)
+                self.assertIn("默认顺着称号说话", prompt)
+                self.assertIn("不要因为命中称号就点名或 @", prompt)
                 self.assertNotIn("对应 QQ", prompt)
             finally:
                 user_titles.title_store = original_store

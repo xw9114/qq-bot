@@ -577,6 +577,75 @@ chat_at = on_message(rule=to_me() & Rule(not_blocked), priority=15, block=True)
 active_chat = on_message(rule=Rule(active_rule), priority=16, block=True)
 
 
+TITLE_MENTION_LABEL_SEPARATORS = set(" \t\r\n，,：:、。.!！?？；;")
+
+
+def iter_title_mention_labels(record) -> list[str]:
+    labels = [
+        record.display_name,
+        record.title,
+        f"QQ {record.user_id}",
+        f"QQ{record.user_id}",
+        str(record.user_id),
+    ]
+    unique_labels: list[str] = []
+    seen = set()
+    for label in labels:
+        if not label or label in seen:
+            continue
+        unique_labels.append(label)
+        seen.add(label)
+    return unique_labels
+
+
+def starts_with_title_mention_label(text: str, label: str) -> tuple[bool, str]:
+    if not text.startswith(label):
+        return False, ""
+
+    tail = text[len(label):]
+    if tail and tail[0] not in TITLE_MENTION_LABEL_SEPARATORS:
+        return False, ""
+    return True, tail
+
+
+def strip_title_mention_separator(text: str) -> str:
+    text = text.lstrip()
+    if text[:1] in {"，", ",", "：", ":", "、"}:
+        return text[1:].lstrip()
+    return text
+
+
+def extract_explicit_title_mention_target(
+    reply: str,
+    mentioned_title_records,
+) -> tuple[int | None, str]:
+    stripped_reply = reply.lstrip()
+    if not stripped_reply.startswith(("@", "＠")):
+        return None, reply
+
+    mention_text = stripped_reply[1:].lstrip()
+    matches: list[tuple[int, int, str]] = []
+    for record in mentioned_title_records:
+        for label in iter_title_mention_labels(record):
+            matched, tail = starts_with_title_mention_label(mention_text, label)
+            if matched:
+                matches.append((record.user_id, len(label), tail))
+
+    if not matches:
+        return None, reply
+
+    max_label_length = max(label_length for _, label_length, _ in matches)
+    best_matches = [
+        match for match in matches if match[1] == max_label_length
+    ]
+    target_ids = {target_id for target_id, _, _ in best_matches}
+    if len(target_ids) != 1:
+        return None, reply
+
+    target_id, _, tail = best_matches[0]
+    return target_id, strip_title_mention_separator(tail)
+
+
 def build_chat_reply_message(
     reply: str,
     event: MessageEvent,
@@ -586,8 +655,15 @@ def build_chat_reply_message(
     if getattr(event, "group_id", None) is None or not mentioned_title_records:
         return reply_message
 
-    target_id = mentioned_title_records[0].user_id
-    return MessageSegment.at(target_id) + " " + reply_message
+    target_id, reply_without_mention = extract_explicit_title_mention_target(
+        reply,
+        mentioned_title_records,
+    )
+    if target_id is None:
+        return reply_message
+    if not reply_without_mention:
+        return Message([MessageSegment.at(target_id)])
+    return MessageSegment.at(target_id) + " " + Message(reply_without_mention)
 
 
 def normalize_segment_text(text: Any) -> str:

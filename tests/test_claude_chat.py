@@ -44,16 +44,56 @@ from plugins.user_titles import UserTitleRecord  # noqa: E402
 
 
 class ClaudeChatReplyTest(unittest.TestCase):
-    def test_group_reply_mentions_first_matched_title_user(self):
+    def test_group_reply_with_title_defaults_to_plain_text(self):
         event = SimpleNamespace(group_id=10000)
         records = [UserTitleRecord(3396024932, "人机", "何以究得物理")]
 
         message = build_chat_reply_message("这个一听就是群里稳定贡献节目效果的选手", event, records)
 
-        segments = [(segment.type, segment.data) for segment in message]
-        self.assertEqual(segments[0], ("at", {"qq": "3396024932"}))
-        self.assertEqual(segments[1], ("text", {"text": " "}))
-        self.assertIn("稳定贡献节目效果", segments[2][1]["text"])
+        self.assertEqual(
+            [(segment.type, segment.data) for segment in message],
+            [("text", {"text": "这个一听就是群里稳定贡献节目效果的选手"})],
+        )
+
+    def test_group_reply_mentions_when_reply_explicitly_targets_title_user(self):
+        event = SimpleNamespace(group_id=10000)
+        records = [UserTitleRecord(3396024932, "人机", "何以究得物理")]
+
+        message = build_chat_reply_message("@人机 出来接一下这个锅", event, records)
+
+        self.assertEqual(
+            [(segment.type, segment.data) for segment in message],
+            [
+                ("at", {"qq": "3396024932"}),
+                ("text", {"text": " "}),
+                ("text", {"text": "出来接一下这个锅"}),
+            ],
+        )
+
+    def test_group_reply_can_be_only_explicit_title_mention(self):
+        event = SimpleNamespace(group_id=10000)
+        records = [UserTitleRecord(3396024932, "人机", "何以究得物理")]
+
+        message = build_chat_reply_message("@人机", event, records)
+
+        self.assertEqual(
+            [(segment.type, segment.data) for segment in message],
+            [("at", {"qq": "3396024932"})],
+        )
+
+    def test_ambiguous_title_mention_stays_plain_text(self):
+        event = SimpleNamespace(group_id=10000)
+        records = [
+            UserTitleRecord(10001, "人机", "甲"),
+            UserTitleRecord(10002, "人机", "乙"),
+        ]
+
+        message = build_chat_reply_message("@人机 出来接一下这个锅", event, records)
+
+        self.assertEqual(
+            [(segment.type, segment.data) for segment in message],
+            [("text", {"text": "@人机 出来接一下这个锅"})],
+        )
 
     def test_private_reply_does_not_mention(self):
         event = SimpleNamespace()
