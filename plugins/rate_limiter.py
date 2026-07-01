@@ -102,6 +102,9 @@ class OutboundRateLimiter:
                 if delay > 0:
                     await asyncio.sleep(delay)
 
+                if request.future.cancelled():
+                    continue
+
                 sent_at = loop.time()
                 self._last_global_send = sent_at
                 if request.group_id is not None:
@@ -123,8 +126,22 @@ class OutboundRateLimiter:
             finally:
                 self._queue.task_done()
 
+    def _cancel_pending_requests(self) -> None:
+        if self._queue is None:
+            return
+
+        while True:
+            try:
+                request = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if not request.future.done():
+                request.future.cancel()
+            self._queue.task_done()
+
     async def shutdown(self) -> None:
         if self._worker is None:
+            self._cancel_pending_requests()
             return
         self._worker.cancel()
         try:
@@ -132,6 +149,7 @@ class OutboundRateLimiter:
         except asyncio.CancelledError:
             pass
         self._worker = None
+        self._cancel_pending_requests()
 
 
 def _normalize_id(value: Any) -> str | None:

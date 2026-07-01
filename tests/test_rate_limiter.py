@@ -62,6 +62,65 @@ class OutboundRateLimiterTest(unittest.TestCase):
 
         asyncio.run(run_test())
 
+    def test_cancelled_request_is_not_sent_after_waiting(self):
+        async def run_test():
+            limiter = OutboundRateLimiter(0.03, 0, 0)
+            limiter._last_global_send = asyncio.get_running_loop().time()
+            operation_called = False
+
+            async def operation() -> None:
+                nonlocal operation_called
+                operation_called = True
+
+            task = asyncio.create_task(limiter.submit(operation, None, None))
+            await asyncio.sleep(0)
+            task.cancel()
+
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            await asyncio.sleep(0.05)
+            await limiter.shutdown()
+
+            self.assertFalse(operation_called)
+
+        asyncio.run(run_test())
+
+    def test_shutdown_cancels_queued_requests(self):
+        async def run_test():
+            limiter = OutboundRateLimiter(0, 0, 0)
+            first_started = asyncio.Event()
+            release_first = asyncio.Event()
+
+            async def blocking_operation() -> None:
+                first_started.set()
+                await release_first.wait()
+
+            async def queued_operation() -> None:
+                return None
+
+            first_task = asyncio.create_task(
+                limiter.submit(blocking_operation, None, None)
+            )
+            second_task = asyncio.create_task(
+                limiter.submit(queued_operation, None, None)
+            )
+
+            await first_started.wait()
+            await limiter.shutdown()
+
+            results = await asyncio.gather(
+                first_task,
+                second_task,
+                return_exceptions=True,
+            )
+
+            self.assertTrue(
+                all(isinstance(result, asyncio.CancelledError) for result in results)
+            )
+
+        asyncio.run(run_test())
+
     def test_resolves_ids_from_current_event(self):
         token = current_event.set(SimpleNamespace(group_id=10001, user_id=20001))
         try:
