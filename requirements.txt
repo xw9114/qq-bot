@@ -2,6 +2,8 @@ nonebot2[fastapi,httpx,websockets]>=2.4,<3.0
 nonebot-adapter-onebot>=2.4,<3.0
 openai>=2.30,<3.0
 python-dotenv>=1.0,<2.0
+edge-tts>=6.1,<8.0
+httpx>=0.24,<1.0
 
 nonebot_plugin_boardgame>=0.4,<1.0
 nonebot-plugin-hitokoto>=0.2,<1.0
