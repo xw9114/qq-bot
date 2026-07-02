@@ -50,11 +50,44 @@ class ParseSongIdTest(unittest.TestCase):
         self.assertIsNone(music_chat.parse_song_id("   "))
 
 
+class ParseQuickSongRequestTest(unittest.TestCase):
+    def test_compact_point_song_command(self):
+        self.assertEqual(music_chat.parse_quick_song_request("点歌晴天"), "晴天")
+
+    def test_natural_point_song_command_with_space(self):
+        self.assertEqual(
+            music_chat.parse_quick_song_request("来一首 晴天 周杰伦"),
+            "晴天 周杰伦",
+        )
+
+    def test_play_command_with_link(self):
+        self.assertEqual(
+            music_chat.parse_quick_song_request(
+                "播放一下 https://music.163.com/song?id=3339230677"
+            ),
+            "https://music.163.com/song?id=3339230677",
+        )
+
+    def test_slash_command_is_left_to_command_handler(self):
+        self.assertIsNone(music_chat.parse_quick_song_request("/点歌 晴天"))
+
+    def test_empty_query_returns_none(self):
+        self.assertIsNone(music_chat.parse_quick_song_request("点歌   "))
+
+
 class BuildDirectDownloadUrlTest(unittest.TestCase):
     def test_builds_expected_url(self):
         self.assertEqual(
             music_chat.build_direct_download_url(123),
             "https://music.163.com/song/media/outer/url?id=123.mp3",
+        )
+
+
+class BuildSearchUrlTest(unittest.TestCase):
+    def test_percent_encodes_chinese_keyword(self):
+        self.assertEqual(
+            music_chat.build_search_url("http://127.0.0.1:3000", "晴天 周杰伦", 5),
+            "http://127.0.0.1:3000/search?keywords=%E6%99%B4%E5%A4%A9%20%E5%91%A8%E6%9D%B0%E4%BC%A6&limit=5",
         )
 
 
@@ -93,6 +126,42 @@ class ParseSearchResultTest(unittest.TestCase):
         self.assertIsNone(
             music_chat.parse_search_result({"result": {"songs": [{"id": 1}]}})
         )
+
+
+class ParseSearchResultsTest(unittest.TestCase):
+    def test_parses_multiple_valid_songs(self):
+        payload = {
+            "result": {
+                "songs": [
+                    {"id": 1, "name": "第一首", "artists": [{"name": "A"}]},
+                    {"id": 2, "name": "第二首", "artists": [{"name": "B"}]},
+                ]
+            }
+        }
+        self.assertEqual(
+            music_chat.parse_search_results(payload),
+            [(1, "第一首 - A"), (2, "第二首 - B")],
+        )
+
+    def test_skips_malformed_songs_and_respects_limit(self):
+        payload = {
+            "result": {
+                "songs": [
+                    {"name": "缺id"},
+                    {"id": 1, "name": "第一首"},
+                    {"id": 2, "name": "第二首"},
+                    {"id": 3, "name": "第三首"},
+                ]
+            }
+        }
+        self.assertEqual(
+            music_chat.parse_search_results(payload, limit=2),
+            [(1, "第一首"), (2, "第二首")],
+        )
+
+    def test_malformed_payload_returns_empty_list(self):
+        self.assertEqual(music_chat.parse_search_results(None), [])
+        self.assertEqual(music_chat.parse_search_results({"result": {}}), [])
 
 
 class ParseSongUrlResultTest(unittest.TestCase):
@@ -203,6 +272,48 @@ class DownloadAudioTest(unittest.IsolatedAsyncioTestCase):
         async with httpx.AsyncClient(transport=transport) as client:
             self.assertIsNone(await music_chat.download_audio(client, "https://test"))
         self.assertEqual(stream.iterated_chunks, 2)
+
+
+class DownloadAvailableSongTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._api_base_url = music_chat.MUSIC_API_BASE_URL
+
+    def tearDown(self):
+        music_chat.MUSIC_API_BASE_URL = self._api_base_url
+
+    async def test_skips_unavailable_candidate_and_returns_next_audio(self):
+        music_chat.MUSIC_API_BASE_URL = "https://api.test"
+        audio = b"a" * (60 * 1024)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "api.test":
+                song_id = request.url.params["id"]
+                return httpx.Response(
+                    200,
+                    json={"data": [{"url": f"https://cdn.test/{song_id}.mp3"}]},
+                )
+            if request.url.path == "/1.mp3":
+                return httpx.Response(
+                    200,
+                    headers={"content-type": "text/html"},
+                    content=b"not audio",
+                )
+            return httpx.Response(
+                200,
+                headers={"content-type": "audio/mpeg"},
+                content=audio,
+            )
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            self.assertEqual(
+                await music_chat.download_available_song(
+                    client,
+                    [(1, "坏的"), (2, "好的")],
+                    skip_errors=True,
+                ),
+                (audio, "好的"),
+            )
 
 
 if __name__ == "__main__":

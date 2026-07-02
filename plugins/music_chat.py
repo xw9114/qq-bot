@@ -12,12 +12,13 @@
 import base64
 import re
 from typing import Any
+from urllib.parse import quote
 
 import httpx
-from nonebot import get_driver, on_command
+from nonebot import get_driver, on_command, on_regex
 from nonebot.adapters.onebot.v11 import Message, MessageEvent, MessageSegment
 from nonebot.log import logger
-from nonebot.params import CommandArg
+from nonebot.params import CommandArg, RegexGroup
 from plugins.command_cooldown import SessionCooldown
 
 config = get_driver().config
@@ -56,11 +57,16 @@ MUSIC_MAX_SIZE_BYTES = _read_int("music_max_size_mb", 15) * 1024 * 1024
 MUSIC_COMMAND_COOLDOWN = _read_float("music_command_cooldown", 30.0)
 
 MIN_AUDIO_BYTES = 50 * 1024  # 低于这个大小的响应视为下架/会员占位音频
+SEARCH_CANDIDATE_LIMIT = 5
 
 DOWNLOAD_TIMEOUT = httpx.Timeout(30.0)
 DOWNLOAD_HEADERS = {"Referer": "https://music.163.com/"}
 
 SONG_ID_PATTERN = re.compile(r"id=(\d+)")
+QUICK_POINT_SONG_REGEX = (
+    r"^(?:点歌|点首|点一首|来首|来一首|放歌|放首|放一首|播放(?:一下)?)\s*(\S.*)$"
+)
+QUICK_POINT_SONG_PATTERN = re.compile(QUICK_POINT_SONG_REGEX)
 music_cooldown = SessionCooldown(MUSIC_COMMAND_COOLDOWN)
 
 
@@ -77,6 +83,15 @@ def parse_song_id(text: str) -> int | None:
     return None
 
 
+def parse_quick_song_request(text: str) -> str | None:
+    """解析不带斜杠的点歌口令，如“点歌晴天”“来一首 晴天”。"""
+    match = QUICK_POINT_SONG_PATTERN.fullmatch(text.strip())
+    if not match:
+        return None
+    query = match.group(1).strip()
+    return query or None
+
+
 def music_session_key(event: MessageEvent) -> tuple:
     group_id = getattr(event, "group_id", None)
     if group_id is not None:
@@ -88,16 +103,18 @@ def build_direct_download_url(song_id: int) -> str:
     return f"https://music.163.com/song/media/outer/url?id={song_id}.mp3"
 
 
-def parse_search_result(payload: Any) -> tuple[int, str] | None:
-    """解析 NeteaseCloudMusicApi /search 响应，取第一条结果。"""
-    if not isinstance(payload, dict):
-        return None
-    songs = (payload.get("result") or {}).get("songs")
-    if not isinstance(songs, list) or not songs:
-        return None
-    song = songs[0]
+def build_search_url(
+    base_url: str,
+    keyword: str,
+    limit: int = SEARCH_CANDIDATE_LIMIT,
+) -> str:
+    return f"{base_url}/search?keywords={quote(keyword, safe='')}&limit={limit}"
+
+
+def parse_search_song(song: Any) -> tuple[int, str] | None:
     if not isinstance(song, dict):
         return None
+
     song_id = song.get("id")
     name = str(song.get("name") or "").strip()
     if not isinstance(song_id, int) or not name:
@@ -112,6 +129,34 @@ def parse_search_result(payload: Any) -> tuple[int, str] | None:
                     artist_names.append(artist_name)
     label = f"{name} - {'/'.join(artist_names)}" if artist_names else name
     return song_id, label
+
+
+def parse_search_results(
+    payload: Any,
+    limit: int = SEARCH_CANDIDATE_LIMIT,
+) -> list[tuple[int, str]]:
+    """解析 NeteaseCloudMusicApi /search 响应，取前几条有效结果。"""
+    if not isinstance(payload, dict):
+        return []
+    songs = (payload.get("result") or {}).get("songs")
+    if not isinstance(songs, list) or not songs:
+        return []
+
+    results = []
+    for song in songs:
+        result = parse_search_song(song)
+        if result is None:
+            continue
+        results.append(result)
+        if len(results) >= limit:
+            break
+    return results
+
+
+def parse_search_result(payload: Any) -> tuple[int, str] | None:
+    """解析 NeteaseCloudMusicApi /search 响应，取第一条结果。"""
+    results = parse_search_results(payload, limit=1)
+    return results[0] if results else None
 
 
 def parse_song_url_result(payload: Any) -> str | None:
@@ -146,12 +191,12 @@ def parse_content_length(value: str | None) -> int | None:
     return length if length >= 0 else None
 
 
-async def search_song(client: httpx.AsyncClient, keyword: str) -> tuple[int, str] | None:
+async def search_songs(client: httpx.AsyncClient, keyword: str) -> list[tuple[int, str]]:
     response = await client.get(
-        f"{MUSIC_API_BASE_URL}/search", params={"keywords": keyword, "limit": 1}
+        build_search_url(MUSIC_API_BASE_URL, keyword, SEARCH_CANDIDATE_LIMIT)
     )
     response.raise_for_status()
-    return parse_search_result(response.json())
+    return parse_search_results(response.json())
 
 
 async def resolve_playable_url(client: httpx.AsyncClient, song_id: int) -> str:
@@ -192,52 +237,93 @@ async def download_audio(client: httpx.AsyncClient, url: str) -> bytes | None:
     return bytes(content)
 
 
-point_song_cmd = on_command("点歌", priority=3, block=True)
+async def download_available_song(
+    client: httpx.AsyncClient,
+    candidates: list[tuple[int, str | None]],
+    skip_errors: bool,
+) -> tuple[bytes, str | None] | None:
+    for song_id, song_label in candidates:
+        try:
+            play_url = await resolve_playable_url(client, song_id)
+            audio = await download_audio(client, play_url)
+        except httpx.HTTPError as error:
+            if not skip_errors:
+                raise
+            logger.warning("点歌候选下载失败，跳过 {}：{}", song_id, error)
+            continue
+
+        if audio is not None:
+            return audio, song_label
+        logger.info("点歌候选不可用，跳过 {} {}", song_id, song_label or "")
+    return None
 
 
-@point_song_cmd.handle()
-async def handle_point_song(event: MessageEvent, arg: Message = CommandArg()):
-    text = arg.extract_plain_text().strip()
+async def handle_song_request(matcher, event: MessageEvent, text: str) -> None:
     if not text:
-        await point_song_cmd.finish("用法：/点歌 [歌名/网易云歌曲ID/分享链接]")
+        await matcher.finish("用法：/点歌 [歌名/网易云歌曲ID/分享链接]，也可以直接说“点歌晴天”")
 
-    song_label: str | None = None
     song_id = parse_song_id(text)
     if song_id is None and not MUSIC_API_BASE_URL:
-        await point_song_cmd.finish(
+        await matcher.finish(
             "❌ 未配置搜索源，请直接发送网易云歌曲 ID 或分享链接"
             "（如 https://music.163.com/song?id=xxxxx）"
         )
 
     retry_after = music_cooldown.retry_after(music_session_key(event))
     if retry_after is not None:
-        await point_song_cmd.finish(f"点歌太频繁了，请 {retry_after} 秒后再试")
+        await matcher.finish(f"点歌太频繁了，请 {retry_after} 秒后再试")
 
     async with httpx.AsyncClient(
         follow_redirects=True, timeout=DOWNLOAD_TIMEOUT
     ) as client:
         if song_id is None:
             try:
-                result = await search_song(client, text)
+                candidates = await search_songs(client, text)
             except httpx.HTTPError as error:
                 logger.warning("点歌搜索失败：{}", error)
-                await point_song_cmd.finish("❌ 搜索失败，请稍后重试")
+                await matcher.finish("❌ 搜索失败，请稍后重试")
+            if not candidates:
+                await matcher.finish("没找到这首歌，换个关键词或直接发链接试试")
+
+            result = await download_available_song(
+                client, candidates, skip_errors=True
+            )
             if result is None:
-                await point_song_cmd.finish("没找到这首歌，换个关键词或直接发链接试试")
-            song_id, song_label = result
-
-        try:
-            play_url = await resolve_playable_url(client, song_id)
-            audio = await download_audio(client, play_url)
-        except httpx.HTTPError as error:
-            logger.warning("点歌下载失败：{}", error)
-            await point_song_cmd.finish("❌ 下载失败，请稍后重试")
-
-    if audio is None:
-        await point_song_cmd.finish("这首歌可能是会员专享或已下架，换一首试试")
+                await matcher.finish("找到几首，但都可能是会员专享或已下架，换个关键词试试")
+            audio, song_label = result
+        else:
+            try:
+                result = await download_available_song(
+                    client, [(song_id, None)], skip_errors=False
+                )
+            except httpx.HTTPError as error:
+                logger.warning("点歌下载失败：{}", error)
+                await matcher.finish("❌ 下载失败，请稍后重试")
+            if result is None:
+                await matcher.finish("这首歌可能是会员专享或已下架，换一首试试")
+            audio, song_label = result
 
     if song_label:
-        await point_song_cmd.send(f"🎵 {song_label}")
+        await matcher.send(f"🎵 {song_label}")
 
     encoded = base64.b64encode(audio).decode()
-    await point_song_cmd.finish(MessageSegment.record(f"base64://{encoded}"))
+    await matcher.finish(MessageSegment.record(f"base64://{encoded}"))
+
+
+point_song_cmd = on_command("点歌", priority=3, block=True)
+quick_point_song_cmd = on_regex(QUICK_POINT_SONG_REGEX, priority=4, block=True)
+
+
+@point_song_cmd.handle()
+async def handle_point_song(event: MessageEvent, arg: Message = CommandArg()):
+    text = arg.extract_plain_text().strip()
+    await handle_song_request(point_song_cmd, event, text)
+
+
+@quick_point_song_cmd.handle()
+async def handle_quick_point_song(
+    event: MessageEvent,
+    matched: tuple[str, ...] = RegexGroup(),
+):
+    text = matched[0].strip() if matched else ""
+    await handle_song_request(quick_point_song_cmd, event, text)
