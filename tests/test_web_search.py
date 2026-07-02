@@ -75,6 +75,14 @@ class WebSearchCommandParseTest(unittest.TestCase):
             "Python 最新版本",
         )
         self.assertEqual(
+            web_search.parse_quick_web_search("联网搜索 张雪峰"),
+            "张雪峰",
+        )
+        self.assertEqual(
+            web_search.parse_quick_web_search("联网查一下 今天新闻"),
+            "今天新闻",
+        )
+        self.assertEqual(
             web_search.parse_quick_web_search("查一下 北京天气"),
             "北京天气",
         )

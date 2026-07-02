@@ -680,7 +680,8 @@ async def greet_rule(event: MessageEvent) -> bool:
 # 因此这里同时保留帮助中公开的裸指令入口。
 BLOCKED_KEYWORDS = {
     # 联网搜索
-    "联网", "搜索", "查一下", "查一查",
+    "联网", "联网搜索", "联网查一下", "联网查一查",
+    "搜索", "搜一下", "查一下", "查一查", "帮我搜一下",
     # 娱乐
     "抽老婆", "随机老婆", "抽wife", "随机wife", "今日wife", "今日老婆",
     "塔罗", "占卜", "抽牌", "笑话", "joke", "一言", "一句",
@@ -700,7 +701,7 @@ def is_plugin_command(message: str) -> bool:
     if msg.startswith("/"):
         return True
 
-    for keyword in BLOCKED_KEYWORDS:
+    for keyword in sorted(BLOCKED_KEYWORDS, key=len, reverse=True):
         if not msg.startswith(keyword):
             continue
         suffix = msg[len(keyword):]

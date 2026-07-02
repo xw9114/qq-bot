@@ -56,7 +56,9 @@ WEB_SEARCH_HEADERS = {
     )
 }
 
-QUICK_WEB_SEARCH_REGEX = r"^(?:联网|搜索|查一下|查一查)\s+(\S.*)$"
+QUICK_WEB_SEARCH_REGEX = (
+    r"^(?:联网(?:搜索|查一下|查一查)?|搜索|搜一下|查一下|查一查|帮我搜一下)\s*(\S.*)$"
+)
 QUICK_WEB_SEARCH_PATTERN = re.compile(QUICK_WEB_SEARCH_REGEX)
 web_search_cooldown = SessionCooldown(WEB_SEARCH_COMMAND_COOLDOWN)
 

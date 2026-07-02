@@ -36,6 +36,7 @@ from plugins.claude_chat import format_user_message  # noqa: E402
 from plugins.claude_chat import greet_rule  # noqa: E402
 from plugins.claude_chat import get_session_lock  # noqa: E402
 from plugins.claude_chat import image_cache_last_seen  # noqa: E402
+from plugins.claude_chat import is_plugin_command  # noqa: E402
 from plugins.claude_chat import memory_update_generations  # noqa: E402
 from plugins.claude_chat import memory_update_locks  # noqa: E402
 from plugins.claude_chat import memory_update_task_counts  # noqa: E402
@@ -334,6 +335,11 @@ class ClaudeChatTriggerRuleTest(unittest.TestCase):
 
         self.assertTrue(asyncio.run(bye_rule(event)))
         self.assertFalse(asyncio.run(greet_rule(event)))
+
+    def test_web_search_commands_are_not_taken_by_chat(self):
+        self.assertTrue(is_plugin_command("联网搜索 张雪峰"))
+        self.assertTrue(is_plugin_command("联网查一下 今天新闻"))
+        self.assertTrue(is_plugin_command("帮我搜一下 Python 最新版本"))
 
 
 class ClaudeChatPromptTest(unittest.TestCase):
