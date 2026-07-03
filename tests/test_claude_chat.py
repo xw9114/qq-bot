@@ -723,10 +723,12 @@ class ClaudeChatIdleNudgeTest(unittest.TestCase):
     def setUp(self):
         self._idle_seconds = claude_chat.CHAT_IDLE_NUDGE_SECONDS
         self._idle_message = claude_chat.CHAT_IDLE_NUDGE_MESSAGE
+        self._idle_group_ids = claude_chat.CHAT_IDLE_NUDGE_GROUP_IDS
 
     def tearDown(self):
         claude_chat.CHAT_IDLE_NUDGE_SECONDS = self._idle_seconds
         claude_chat.CHAT_IDLE_NUDGE_MESSAGE = self._idle_message
+        claude_chat.CHAT_IDLE_NUDGE_GROUP_IDS = self._idle_group_ids
         active_users.clear()
         user_modes.clear()
         quiz_answers.clear()
@@ -738,6 +740,13 @@ class ClaudeChatIdleNudgeTest(unittest.TestCase):
     def enable_idle_nudge(self):
         claude_chat.CHAT_IDLE_NUDGE_SECONDS = 10
         claude_chat.CHAT_IDLE_NUDGE_MESSAGE = "人呢，还聊不聊"
+        claude_chat.CHAT_IDLE_NUDGE_GROUP_IDS = {10000}
+
+    def test_parse_idle_nudge_messages_filters_empty_items(self):
+        self.assertEqual(
+            claude_chat.parse_idle_nudge_messages("人呢| 还聊吗 | |空气安静了 "),
+            ["人呢", "还聊吗", "空气安静了"],
+        )
 
     def test_due_sessions_require_active_state_target_and_timeout(self):
         self.enable_idle_nudge()
@@ -755,6 +764,18 @@ class ClaudeChatIdleNudgeTest(unittest.TestCase):
         )
         self.assertEqual(claude_chat.get_due_idle_nudge_sessions(109.9), [])
         self.assertEqual(claude_chat.get_due_idle_nudge_sessions(110.0), [session_key])
+
+    def test_due_sessions_skip_non_whitelisted_groups(self):
+        self.enable_idle_nudge()
+        session_key = ("group", 12345, 20000)
+        active_users.add(session_key)
+        session_last_seen[session_key] = 100.0
+        claude_chat.session_targets[session_key] = claude_chat.SessionTarget(
+            user_id=12345,
+            group_id=20000,
+        )
+
+        self.assertEqual(claude_chat.get_due_idle_nudge_sessions(120.0), [])
 
     def test_group_idle_nudge_resets_timer_after_each_send(self):
         class FakeBot:
@@ -791,7 +812,7 @@ class ClaudeChatIdleNudgeTest(unittest.TestCase):
 
         asyncio.run(run_test())
 
-    def test_private_idle_nudge_uses_private_message_api(self):
+    def test_private_idle_nudge_is_ignored(self):
         class FakeBot:
             def __init__(self):
                 self.calls = []
@@ -808,11 +829,9 @@ class ClaudeChatIdleNudgeTest(unittest.TestCase):
             claude_chat.touch_session(session_key, now=100.0)
 
             bot = FakeBot()
-            self.assertEqual(await claude_chat.send_due_idle_nudges(bot, now=120.0), 1)
+            self.assertEqual(await claude_chat.send_due_idle_nudges(bot, now=120.0), 0)
 
-            self.assertEqual(bot.calls[0][0], "send_private_msg")
-            self.assertEqual(bot.calls[0][1]["user_id"], 12345)
-            self.assertEqual(str(bot.calls[0][1]["message"]), "人呢，还聊不聊")
+            self.assertEqual(bot.calls, [])
 
         asyncio.run(run_test())
 

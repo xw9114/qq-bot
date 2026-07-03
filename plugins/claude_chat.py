@@ -50,8 +50,44 @@ def _read_str(name: str, default: str) -> str:
     return value or default
 
 
+def _read_int_set(name: str) -> set[int]:
+    value = getattr(config, name, "")
+    if value is None:
+        return set()
+
+    if isinstance(value, (list, tuple, set)):
+        raw_items = value
+    else:
+        raw_items = re.split(r"[\s,，;；|、]+", str(value).strip().strip("[]"))
+
+    result: set[int] = set()
+    for item in raw_items:
+        text = str(item).strip().strip("'\"")
+        if not text:
+            continue
+        try:
+            group_id = int(text)
+        except ValueError:
+            logger.warning("配置 {} 包含无效群号：{}", name.upper(), text)
+            continue
+        if group_id > 0:
+            result.add(group_id)
+    return result
+
+
+DEFAULT_CHAT_IDLE_NUDGE_MESSAGE = (
+    "人呢，还聊不聊|"
+    "还在吗，别把话撂这儿|"
+    "再不吭声我就当你去忙了|"
+    "这边先挂着，有事继续说|"
+    "空气突然安静了一下"
+)
 CHAT_IDLE_NUDGE_SECONDS = _read_float("chat_idle_nudge_seconds", 0.0)
-CHAT_IDLE_NUDGE_MESSAGE = _read_str("chat_idle_nudge_message", "人呢，还聊不聊")
+CHAT_IDLE_NUDGE_MESSAGE = _read_str(
+    "chat_idle_nudge_message",
+    DEFAULT_CHAT_IDLE_NUDGE_MESSAGE,
+)
+CHAT_IDLE_NUDGE_GROUP_IDS = _read_int_set("chat_idle_nudge_group_ids")
 
 
 @dataclass(frozen=True)
@@ -312,8 +348,35 @@ def has_idle_nudge_session_state(session_key) -> bool:
     )
 
 
+def parse_idle_nudge_messages(message_config: str) -> list[str]:
+    return [
+        message
+        for message in (item.strip() for item in message_config.split("|"))
+        if message
+    ]
+
+
+def idle_nudge_message_candidates() -> list[str]:
+    return parse_idle_nudge_messages(CHAT_IDLE_NUDGE_MESSAGE)
+
+
+def idle_nudge_group_allowed(target: SessionTarget) -> bool:
+    return (
+        target.group_id is not None
+        and target.group_id in CHAT_IDLE_NUDGE_GROUP_IDS
+    )
+
+
+def choose_idle_nudge_message() -> str:
+    return random.choice(idle_nudge_message_candidates())
+
+
 def idle_nudge_enabled() -> bool:
-    return CHAT_IDLE_NUDGE_SECONDS > 0 and bool(CHAT_IDLE_NUDGE_MESSAGE)
+    return (
+        CHAT_IDLE_NUDGE_SECONDS > 0
+        and bool(idle_nudge_message_candidates())
+        and bool(CHAT_IDLE_NUDGE_GROUP_IDS)
+    )
 
 
 def idle_nudge_loop_interval() -> float:
@@ -325,7 +388,8 @@ def idle_nudge_loop_interval() -> float:
 def should_send_idle_nudge(session_key, now: float) -> bool:
     if not idle_nudge_enabled():
         return False
-    if session_key not in session_targets:
+    target = session_targets.get(session_key)
+    if target is None or not idle_nudge_group_allowed(target):
         return False
     if not has_idle_nudge_session_state(session_key):
         return False
@@ -482,18 +546,13 @@ def cleanup_runtime_state(now: float | None = None) -> tuple[int, int]:
 
 
 async def send_idle_nudge_message(bot: Bot, target: SessionTarget) -> None:
-    message = Message(CHAT_IDLE_NUDGE_MESSAGE)
-    if target.group_id is not None:
-        await bot.call_api(
-            "send_group_msg",
-            group_id=target.group_id,
-            message=message,
-        )
+    if target.group_id is None:
         return
 
+    message = Message(choose_idle_nudge_message())
     await bot.call_api(
-        "send_private_msg",
-        user_id=target.user_id,
+        "send_group_msg",
+        group_id=target.group_id,
         message=message,
     )
 
