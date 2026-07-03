@@ -11,14 +11,17 @@
 
 import base64
 import re
+import time
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
 import httpx
-from nonebot import get_driver, on_command, on_regex
+from nonebot import get_driver, on_command, on_message, on_regex
 from nonebot.adapters.onebot.v11 import Message, MessageEvent, MessageSegment
 from nonebot.log import logger
 from nonebot.params import CommandArg, RegexGroup
+from nonebot.rule import Rule
 from plugins.command_cooldown import SessionCooldown
 
 config = get_driver().config
@@ -55,6 +58,7 @@ if MUSIC_API_BASE_URL:
     MUSIC_API_BASE_URL = MUSIC_API_BASE_URL.rstrip("/")
 MUSIC_MAX_SIZE_BYTES = _read_int("music_max_size_mb", 15) * 1024 * 1024
 MUSIC_COMMAND_COOLDOWN = _read_float("music_command_cooldown", 30.0)
+MUSIC_SELECTION_TIMEOUT = _read_float("music_selection_timeout", 60.0)
 
 MIN_AUDIO_BYTES = 50 * 1024  # 低于这个大小的响应视为下架/会员占位音频
 SEARCH_CANDIDATE_LIMIT = 5
@@ -67,7 +71,17 @@ QUICK_POINT_SONG_REGEX = (
     r"^(?:点歌|点首|点一首|来首|来一首|放歌|放首|放一首|播放(?:一下)?)\s*(\S.*)$"
 )
 QUICK_POINT_SONG_PATTERN = re.compile(QUICK_POINT_SONG_REGEX)
+MUSIC_SELECTION_INDEX_PATTERN = re.compile(r"^(?:第)?\s*(\d{1,2})\s*(?:首|个)?$")
 music_cooldown = SessionCooldown(MUSIC_COMMAND_COOLDOWN)
+
+
+@dataclass
+class PendingMusicSelection:
+    candidates: list[tuple[int, str]]
+    expires_at: float
+
+
+pending_music_selections: dict[tuple, PendingMusicSelection] = {}
 
 
 def parse_song_id(text: str) -> int | None:
@@ -97,6 +111,76 @@ def music_session_key(event: MessageEvent) -> tuple:
     if group_id is not None:
         return ("group", group_id)
     return ("private", event.user_id)
+
+
+def format_music_candidates(
+    candidates: list[tuple[int, str]],
+    timeout_seconds: float | None = None,
+) -> str:
+    display_candidates = candidates[:SEARCH_CANDIDATE_LIMIT]
+    timeout_seconds = MUSIC_SELECTION_TIMEOUT if timeout_seconds is None else timeout_seconds
+    lines = ["找到这些候选，回复序号点歌："]
+    for index, (_, label) in enumerate(display_candidates, start=1):
+        lines.append(f"{index}. {label}")
+    lines.append(f"请在 {max(1, int(timeout_seconds))} 秒内回复 1-{len(display_candidates)}")
+    return "\n".join(lines)
+
+
+def start_music_selection(
+    session_key: tuple,
+    candidates: list[tuple[int, str]],
+    now: float | None = None,
+) -> None:
+    selected_candidates = candidates[:SEARCH_CANDIDATE_LIMIT]
+    pending_music_selections[session_key] = PendingMusicSelection(
+        candidates=selected_candidates,
+        expires_at=(time.monotonic() if now is None else now) + MUSIC_SELECTION_TIMEOUT,
+    )
+
+
+def parse_music_selection_index(text: str) -> int | None:
+    match = MUSIC_SELECTION_INDEX_PATTERN.fullmatch(text.strip())
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def consume_music_selection(
+    session_key: tuple,
+    text: str,
+    now: float | None = None,
+) -> tuple[str, tuple[int, str] | None]:
+    pending = pending_music_selections.get(session_key)
+    if pending is None:
+        return "missing", None
+
+    current_time = time.monotonic() if now is None else now
+    if current_time >= pending.expires_at:
+        pending_music_selections.pop(session_key, None)
+        return "expired", None
+
+    selected_index = parse_music_selection_index(text)
+    if selected_index is None or not 1 <= selected_index <= len(pending.candidates):
+        return "invalid", None
+
+    candidate = pending.candidates[selected_index - 1]
+    pending_music_selections.pop(session_key, None)
+    return "selected", candidate
+
+
+async def pending_music_selection_rule(event: MessageEvent) -> bool:
+    if music_session_key(event) not in pending_music_selections:
+        return False
+
+    text = event.get_plaintext().strip()
+    if not text or text.startswith("/"):
+        return False
+    if parse_quick_song_request(text) is not None:
+        return False
+    return parse_music_selection_index(text) is not None
 
 
 def build_direct_download_url(song_id: int) -> str:
@@ -258,6 +342,43 @@ async def download_available_song(
     return None
 
 
+async def finish_audio_message(
+    matcher,
+    audio: bytes,
+    song_label: str | None,
+) -> None:
+    if song_label:
+        await matcher.send(f"🎵 {song_label}")
+
+    encoded = base64.b64encode(audio).decode()
+    await matcher.finish(MessageSegment.record(f"base64://{encoded}"))
+
+
+async def download_and_send_song(
+    matcher,
+    song_id: int,
+    song_label: str | None,
+) -> None:
+    async with httpx.AsyncClient(
+        follow_redirects=True, timeout=DOWNLOAD_TIMEOUT
+    ) as client:
+        try:
+            result = await download_available_song(
+                client, [(song_id, song_label)], skip_errors=False
+            )
+        except httpx.HTTPError as error:
+            logger.warning("点歌下载失败：{}", error)
+            await matcher.finish("❌ 下载失败，请稍后重试")
+            return
+
+    if result is None:
+        await matcher.finish("这首歌可能是会员专享或已下架，换一首试试")
+        return
+
+    audio, resolved_label = result
+    await finish_audio_message(matcher, audio, resolved_label)
+
+
 async def handle_song_request(matcher, event: MessageEvent, text: str) -> None:
     if not text:
         await matcher.finish("用法：/点歌 [歌名/网易云歌曲ID/分享链接]，也可以直接说“点歌晴天”")
@@ -273,44 +394,51 @@ async def handle_song_request(matcher, event: MessageEvent, text: str) -> None:
     if retry_after is not None:
         await matcher.finish(f"点歌太频繁了，请 {retry_after} 秒后再试")
 
-    async with httpx.AsyncClient(
-        follow_redirects=True, timeout=DOWNLOAD_TIMEOUT
-    ) as client:
-        if song_id is None:
+    if song_id is None:
+        async with httpx.AsyncClient(
+            follow_redirects=True, timeout=DOWNLOAD_TIMEOUT
+        ) as client:
             try:
                 candidates = await search_songs(client, text)
             except httpx.HTTPError as error:
                 logger.warning("点歌搜索失败：{}", error)
                 await matcher.finish("❌ 搜索失败，请稍后重试")
+                return
             if not candidates:
                 await matcher.finish("没找到这首歌，换个关键词或直接发链接试试")
+                return
 
-            result = await download_available_song(
-                client, candidates, skip_errors=True
-            )
-            if result is None:
-                await matcher.finish("找到几首，但都可能是会员专享或已下架，换个关键词试试")
-            audio, song_label = result
-        else:
-            try:
-                result = await download_available_song(
-                    client, [(song_id, None)], skip_errors=False
-                )
-            except httpx.HTTPError as error:
-                logger.warning("点歌下载失败：{}", error)
-                await matcher.finish("❌ 下载失败，请稍后重试")
-            if result is None:
-                await matcher.finish("这首歌可能是会员专享或已下架，换一首试试")
-            audio, song_label = result
+        session_key = music_session_key(event)
+        start_music_selection(session_key, candidates)
+        await matcher.finish(format_music_candidates(candidates))
+        return
 
-    if song_label:
-        await matcher.send(f"🎵 {song_label}")
+    pending_music_selections.pop(music_session_key(event), None)
+    await download_and_send_song(matcher, song_id, None)
 
-    encoded = base64.b64encode(audio).decode()
-    await matcher.finish(MessageSegment.record(f"base64://{encoded}"))
+
+async def process_music_selection_reply(matcher, event: MessageEvent, text: str) -> None:
+    session_key = music_session_key(event)
+    status, candidate = consume_music_selection(session_key, text)
+    if status == "expired":
+        await matcher.finish("这次点歌候选已超时，请重新点歌")
+        return
+    if status == "invalid":
+        pending = pending_music_selections.get(session_key)
+        max_index = len(pending.candidates) if pending else SEARCH_CANDIDATE_LIMIT
+        await matcher.finish(f"序号无效，请回复 1-{max_index}")
+        return
+    if status != "selected" or candidate is None:
+        return
+
+    song_id, song_label = candidate
+    await download_and_send_song(matcher, song_id, song_label)
 
 
 point_song_cmd = on_command("点歌", priority=3, block=True)
+music_selection_reply = on_message(
+    rule=Rule(pending_music_selection_rule), priority=2, block=True
+)
 quick_point_song_cmd = on_regex(QUICK_POINT_SONG_REGEX, priority=4, block=True)
 
 
@@ -327,3 +455,9 @@ async def handle_quick_point_song(
 ):
     text = matched[0].strip() if matched else ""
     await handle_song_request(quick_point_song_cmd, event, text)
+
+
+@music_selection_reply.handle()
+async def handle_music_selection_reply(event: MessageEvent):
+    text = event.get_plaintext().strip()
+    await process_music_selection_reply(music_selection_reply, event, text)

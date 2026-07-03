@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import httpx
 import nonebot
@@ -21,6 +22,25 @@ class CountingStream(httpx.AsyncByteStream):
 
     async def aclose(self):
         pass
+
+
+class FinishCalled(Exception):
+    def __init__(self, message):
+        super().__init__(str(message))
+        self.message = message
+
+
+class FakeMatcher:
+    def __init__(self):
+        self.sent = []
+        self.finished = []
+
+    async def send(self, message):
+        self.sent.append(message)
+
+    async def finish(self, message):
+        self.finished.append(message)
+        raise FinishCalled(message)
 
 
 class ParseSongIdTest(unittest.TestCase):
@@ -162,6 +182,94 @@ class ParseSearchResultsTest(unittest.TestCase):
     def test_malformed_payload_returns_empty_list(self):
         self.assertEqual(music_chat.parse_search_results(None), [])
         self.assertEqual(music_chat.parse_search_results({"result": {}}), [])
+
+
+class MusicSelectionStateTest(unittest.TestCase):
+    def setUp(self):
+        self._selection_timeout = music_chat.MUSIC_SELECTION_TIMEOUT
+
+    def tearDown(self):
+        music_chat.MUSIC_SELECTION_TIMEOUT = self._selection_timeout
+        music_chat.pending_music_selections.clear()
+
+    def test_formats_candidate_list_and_caps_at_five(self):
+        candidates = [(index, f"歌曲{index}") for index in range(1, 7)]
+
+        self.assertEqual(
+            music_chat.format_music_candidates(candidates, timeout_seconds=30),
+            "\n".join(
+                [
+                    "找到这些候选，回复序号点歌：",
+                    "1. 歌曲1",
+                    "2. 歌曲2",
+                    "3. 歌曲3",
+                    "4. 歌曲4",
+                    "5. 歌曲5",
+                    "请在 30 秒内回复 1-5",
+                ]
+            ),
+        )
+
+    def test_selects_candidate_and_clears_pending_state(self):
+        music_chat.MUSIC_SELECTION_TIMEOUT = 60
+        session_key = ("group", 10000)
+        music_chat.start_music_selection(
+            session_key,
+            [(1, "第一首"), (2, "第二首"), (3, "第三首")],
+            now=100,
+        )
+
+        status, candidate = music_chat.consume_music_selection(
+            session_key, "2", now=120
+        )
+
+        self.assertEqual(status, "selected")
+        self.assertEqual(candidate, (2, "第二首"))
+        self.assertNotIn(session_key, music_chat.pending_music_selections)
+
+    def test_invalid_index_keeps_pending_state(self):
+        music_chat.MUSIC_SELECTION_TIMEOUT = 60
+        session_key = ("group", 10000)
+        music_chat.start_music_selection(
+            session_key,
+            [(1, "第一首"), (2, "第二首"), (3, "第三首")],
+            now=100,
+        )
+
+        status, candidate = music_chat.consume_music_selection(
+            session_key, "4", now=120
+        )
+
+        self.assertEqual(status, "invalid")
+        self.assertIsNone(candidate)
+        self.assertIn(session_key, music_chat.pending_music_selections)
+
+    def test_expired_selection_is_cleared(self):
+        music_chat.MUSIC_SELECTION_TIMEOUT = 10
+        session_key = ("group", 10000)
+        music_chat.start_music_selection(session_key, [(1, "第一首")], now=100)
+
+        status, candidate = music_chat.consume_music_selection(
+            session_key, "1", now=110
+        )
+
+        self.assertEqual(status, "expired")
+        self.assertIsNone(candidate)
+        self.assertNotIn(session_key, music_chat.pending_music_selections)
+
+    def test_group_sessions_are_isolated(self):
+        music_chat.MUSIC_SELECTION_TIMEOUT = 60
+        first_group = ("group", 10000)
+        second_group = ("group", 20000)
+        music_chat.start_music_selection(first_group, [(1, "第一首")], now=100)
+
+        status, candidate = music_chat.consume_music_selection(
+            second_group, "1", now=120
+        )
+
+        self.assertEqual(status, "missing")
+        self.assertIsNone(candidate)
+        self.assertIn(first_group, music_chat.pending_music_selections)
 
 
 class ParseSongUrlResultTest(unittest.TestCase):
@@ -314,6 +422,119 @@ class DownloadAvailableSongTest(unittest.IsolatedAsyncioTestCase):
                 ),
                 (audio, "好的"),
             )
+
+
+class MusicSearchFlowTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._api_base_url = music_chat.MUSIC_API_BASE_URL
+        self._music_cooldown = music_chat.music_cooldown
+        self._search_songs = music_chat.search_songs
+        self._download_available_song = music_chat.download_available_song
+        self._download_and_send_song = music_chat.download_and_send_song
+        self._selection_timeout = music_chat.MUSIC_SELECTION_TIMEOUT
+        music_chat.pending_music_selections.clear()
+
+    def tearDown(self):
+        music_chat.MUSIC_API_BASE_URL = self._api_base_url
+        music_chat.music_cooldown = self._music_cooldown
+        music_chat.search_songs = self._search_songs
+        music_chat.download_available_song = self._download_available_song
+        music_chat.download_and_send_song = self._download_and_send_song
+        music_chat.MUSIC_SELECTION_TIMEOUT = self._selection_timeout
+        music_chat.pending_music_selections.clear()
+
+    async def test_name_search_returns_candidates_without_downloading(self):
+        music_chat.MUSIC_API_BASE_URL = "https://api.test"
+        music_chat.music_cooldown = music_chat.SessionCooldown(0)
+        download_calls = []
+
+        async def fake_search_songs(client, keyword):
+            self.assertEqual(keyword, "晴天")
+            return [(1, "晴天 - 周杰伦"), (2, "晴天 - 其他"), (3, "晴天 Live")]
+
+        async def fake_download_available_song(*args, **kwargs):
+            download_calls.append((args, kwargs))
+            return None
+
+        music_chat.search_songs = fake_search_songs
+        music_chat.download_available_song = fake_download_available_song
+        matcher = FakeMatcher()
+        event = SimpleNamespace(user_id=12345, group_id=10000)
+
+        with self.assertRaises(FinishCalled) as context:
+            await music_chat.handle_song_request(matcher, event, "晴天")
+
+        self.assertEqual(download_calls, [])
+        self.assertIn("1. 晴天 - 周杰伦", context.exception.message)
+        self.assertIn("3. 晴天 Live", context.exception.message)
+        self.assertEqual(
+            music_chat.pending_music_selections[("group", 10000)].candidates,
+            [(1, "晴天 - 周杰伦"), (2, "晴天 - 其他"), (3, "晴天 Live")],
+        )
+
+    async def test_selection_reply_downloads_selected_candidate(self):
+        music_chat.MUSIC_SELECTION_TIMEOUT = 60
+        session_key = ("group", 10000)
+        music_chat.start_music_selection(
+            session_key,
+            [(1, "第一首"), (2, "第二首"), (3, "第三首")],
+        )
+        calls = []
+
+        async def fake_download_and_send_song(matcher, song_id, song_label):
+            calls.append((song_id, song_label))
+
+        music_chat.download_and_send_song = fake_download_and_send_song
+        event = SimpleNamespace(user_id=12345, group_id=10000)
+
+        await music_chat.process_music_selection_reply(FakeMatcher(), event, "2")
+
+        self.assertEqual(calls, [(2, "第二首")])
+        self.assertNotIn(session_key, music_chat.pending_music_selections)
+
+    async def test_direct_song_request_clears_stale_selection(self):
+        music_chat.music_cooldown = music_chat.SessionCooldown(0)
+        session_key = ("group", 10000)
+        music_chat.start_music_selection(session_key, [(1, "第一首")])
+        calls = []
+
+        async def fake_download_and_send_song(matcher, song_id, song_label):
+            calls.append((song_id, song_label))
+
+        music_chat.download_and_send_song = fake_download_and_send_song
+        event = SimpleNamespace(user_id=12345, group_id=10000)
+
+        await music_chat.handle_song_request(FakeMatcher(), event, "3339230677")
+
+        self.assertEqual(calls, [(3339230677, None)])
+        self.assertNotIn(session_key, music_chat.pending_music_selections)
+
+    async def test_selection_reply_rejects_invalid_index(self):
+        music_chat.MUSIC_SELECTION_TIMEOUT = 60
+        session_key = ("group", 10000)
+        music_chat.start_music_selection(session_key, [(1, "第一首"), (2, "第二首")])
+        matcher = FakeMatcher()
+        event = SimpleNamespace(user_id=12345, group_id=10000)
+
+        with self.assertRaises(FinishCalled) as context:
+            await music_chat.process_music_selection_reply(matcher, event, "3")
+
+        self.assertEqual(context.exception.message, "序号无效，请回复 1-2")
+        self.assertIn(session_key, music_chat.pending_music_selections)
+
+    async def test_selection_reply_reports_timeout(self):
+        session_key = ("group", 10000)
+        music_chat.pending_music_selections[session_key] = (
+            music_chat.PendingMusicSelection(candidates=[(1, "第一首")], expires_at=0)
+        )
+        matcher = FakeMatcher()
+        event = SimpleNamespace(user_id=12345, group_id=10000)
+
+        with self.assertRaises(FinishCalled) as context:
+            await music_chat.process_music_selection_reply(matcher, event, "1")
+
+        self.assertEqual(context.exception.message, "这次点歌候选已超时，请重新点歌")
+        self.assertNotIn(session_key, music_chat.pending_music_selections)
 
 
 if __name__ == "__main__":
