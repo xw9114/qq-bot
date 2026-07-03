@@ -479,8 +479,8 @@ class ClaudeChatMemoryInjectionTest(unittest.TestCase):
         recent_image_signatures.clear()
         image_cache_last_seen.clear()
         session_last_seen.clear()
-        claude_chat.session_targets.clear()
-        claude_chat.idle_nudge_last_sent_at.clear()
+        claude_chat.idle_nudge_group_last_seen.clear()
+        claude_chat.idle_nudge_group_last_sent_at.clear()
 
     def test_stale_long_term_summary_is_not_injected_into_chat_prompt(self):
         class FakeCompletions:
@@ -589,8 +589,8 @@ class ClaudeChatStateTransitionTest(unittest.TestCase):
         user_roles.clear()
         quiz_answers.clear()
         session_last_seen.clear()
-        claude_chat.session_targets.clear()
-        claude_chat.idle_nudge_last_sent_at.clear()
+        claude_chat.idle_nudge_group_last_seen.clear()
+        claude_chat.idle_nudge_group_last_sent_at.clear()
 
     def test_role_selection_activates_session_for_numeric_reply(self):
         event = SimpleNamespace(
@@ -646,8 +646,8 @@ class ClaudeChatRuntimeCleanupTest(unittest.TestCase):
         session_last_seen.clear()
         recent_image_signatures.clear()
         image_cache_last_seen.clear()
-        claude_chat.session_targets.clear()
-        claude_chat.idle_nudge_last_sent_at.clear()
+        claude_chat.idle_nudge_group_last_seen.clear()
+        claude_chat.idle_nudge_group_last_sent_at.clear()
 
     def test_clear_runtime_session_state_removes_short_term_state(self):
         session_key = ("group", 12345, 10000)
@@ -734,8 +734,8 @@ class ClaudeChatIdleNudgeTest(unittest.TestCase):
         quiz_answers.clear()
         session_locks.clear()
         session_last_seen.clear()
-        claude_chat.session_targets.clear()
-        claude_chat.idle_nudge_last_sent_at.clear()
+        claude_chat.idle_nudge_group_last_seen.clear()
+        claude_chat.idle_nudge_group_last_sent_at.clear()
 
     def enable_idle_nudge(self):
         claude_chat.CHAT_IDLE_NUDGE_SECONDS = 10
@@ -748,34 +748,26 @@ class ClaudeChatIdleNudgeTest(unittest.TestCase):
             ["人呢", "还聊吗", "空气安静了"],
         )
 
-    def test_due_sessions_require_active_state_target_and_timeout(self):
+    def test_due_groups_require_whitelisted_activity_and_timeout(self):
         self.enable_idle_nudge()
-        session_key = ("group", 12345, 10000)
-        session_last_seen[session_key] = 100.0
+        group_id = 10000
 
-        self.assertEqual(claude_chat.get_due_idle_nudge_sessions(120.0), [])
+        self.assertEqual(claude_chat.get_due_idle_nudge_groups(120.0), [])
 
-        active_users.add(session_key)
-        self.assertEqual(claude_chat.get_due_idle_nudge_sessions(120.0), [])
-
-        claude_chat.session_targets[session_key] = claude_chat.SessionTarget(
-            user_id=12345,
-            group_id=10000,
+        self.assertTrue(
+            claude_chat.record_idle_nudge_group_activity(group_id, now=100.0)
         )
-        self.assertEqual(claude_chat.get_due_idle_nudge_sessions(109.9), [])
-        self.assertEqual(claude_chat.get_due_idle_nudge_sessions(110.0), [session_key])
+
+        self.assertEqual(claude_chat.get_due_idle_nudge_groups(109.9), [])
+        self.assertEqual(claude_chat.get_due_idle_nudge_groups(110.0), [group_id])
 
     def test_due_sessions_skip_non_whitelisted_groups(self):
         self.enable_idle_nudge()
-        session_key = ("group", 12345, 20000)
-        active_users.add(session_key)
-        session_last_seen[session_key] = 100.0
-        claude_chat.session_targets[session_key] = claude_chat.SessionTarget(
-            user_id=12345,
-            group_id=20000,
+        self.assertFalse(
+            claude_chat.record_idle_nudge_group_activity(20000, now=100.0)
         )
 
-        self.assertEqual(claude_chat.get_due_idle_nudge_sessions(120.0), [])
+        self.assertEqual(claude_chat.get_due_idle_nudge_groups(120.0), [])
 
     def test_group_idle_nudge_resets_timer_after_each_send(self):
         class FakeBot:
@@ -787,11 +779,8 @@ class ClaudeChatIdleNudgeTest(unittest.TestCase):
 
         async def run_test():
             self.enable_idle_nudge()
-            event = SimpleNamespace(user_id=12345, group_id=10000)
-            session_key = conversation_key(event)
-            active_users.add(session_key)
-            claude_chat.remember_session_target(session_key, event)
-            claude_chat.touch_session(session_key, now=100.0)
+            group_id = 10000
+            claude_chat.record_idle_nudge_group_activity(group_id, now=100.0)
 
             bot = FakeBot()
             self.assertEqual(await claude_chat.send_due_idle_nudges(bot, now=109.0), 0)
@@ -805,7 +794,7 @@ class ClaudeChatIdleNudgeTest(unittest.TestCase):
             self.assertEqual(data["group_id"], 10000)
             self.assertEqual(str(data["message"]), "人呢，还聊不聊")
 
-            claude_chat.touch_session(session_key, now=131.0)
+            claude_chat.record_idle_nudge_group_activity(group_id, now=131.0)
             self.assertEqual(await claude_chat.send_due_idle_nudges(bot, now=140.9), 0)
             self.assertEqual(await claude_chat.send_due_idle_nudges(bot, now=141.0), 1)
             self.assertEqual(len(bot.calls), 3)
@@ -822,11 +811,7 @@ class ClaudeChatIdleNudgeTest(unittest.TestCase):
 
         async def run_test():
             self.enable_idle_nudge()
-            event = SimpleNamespace(user_id=12345)
-            session_key = conversation_key(event)
-            active_users.add(session_key)
-            claude_chat.remember_session_target(session_key, event)
-            claude_chat.touch_session(session_key, now=100.0)
+            claude_chat.record_idle_nudge_group_activity(None, now=100.0)
 
             bot = FakeBot()
             self.assertEqual(await claude_chat.send_due_idle_nudges(bot, now=120.0), 0)
@@ -835,21 +820,15 @@ class ClaudeChatIdleNudgeTest(unittest.TestCase):
 
         asyncio.run(run_test())
 
-    def test_clear_runtime_session_state_removes_idle_nudge_state(self):
+    def test_record_group_activity_clears_previous_nudge_time(self):
         self.enable_idle_nudge()
-        session_key = ("group", 12345, 10000)
-        active_users.add(session_key)
-        session_last_seen[session_key] = 100.0
-        claude_chat.session_targets[session_key] = claude_chat.SessionTarget(
-            user_id=12345,
-            group_id=10000,
-        )
-        claude_chat.idle_nudge_last_sent_at[session_key] = 110.0
+        group_id = 10000
+        claude_chat.idle_nudge_group_last_sent_at[group_id] = 110.0
 
-        clear_runtime_session_state(session_key)
+        claude_chat.record_idle_nudge_group_activity(group_id, now=120.0)
 
-        self.assertNotIn(session_key, claude_chat.session_targets)
-        self.assertNotIn(session_key, claude_chat.idle_nudge_last_sent_at)
+        self.assertEqual(claude_chat.idle_nudge_group_last_seen[group_id], 120.0)
+        self.assertNotIn(group_id, claude_chat.idle_nudge_group_last_sent_at)
 
 
 class ClaudeChatByeHandlerTest(unittest.TestCase):
@@ -861,8 +840,8 @@ class ClaudeChatByeHandlerTest(unittest.TestCase):
         user_history.clear()
         session_locks.clear()
         session_last_seen.clear()
-        claude_chat.session_targets.clear()
-        claude_chat.idle_nudge_last_sent_at.clear()
+        claude_chat.idle_nudge_group_last_seen.clear()
+        claude_chat.idle_nudge_group_last_sent_at.clear()
 
     def test_handle_bye_clears_state_and_uses_natural_message(self):
         class FakeByeChat:

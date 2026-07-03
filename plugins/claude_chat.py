@@ -1,7 +1,6 @@
 import asyncio
 import re
 import time
-from dataclasses import dataclass
 from typing import Any
 
 from nonebot import on_message, on_command, get_driver, get_bots
@@ -90,12 +89,6 @@ CHAT_IDLE_NUDGE_MESSAGE = _read_str(
 CHAT_IDLE_NUDGE_GROUP_IDS = _read_int_set("chat_idle_nudge_group_ids")
 
 
-@dataclass(frozen=True)
-class SessionTarget:
-    user_id: int
-    group_id: int | None = None
-
-
 if not api_key:
     logger.warning("未配置 OPENAI_API_KEY，ChatGPT 功能将不可用")
     client = None
@@ -117,8 +110,8 @@ memory_update_generations = {}  # 清除记忆后阻止旧后台任务回写
 recent_image_signatures = {}  # 群/私聊范围内最近识别过的图片
 session_last_seen = {}  # 会话最近活跃时间
 image_cache_last_seen = {}  # 图片缓存最近活跃时间
-session_targets = {}  # 会话最后一次消息目标，用于空闲提醒
-idle_nudge_last_sent_at = {}  # 会话上次空闲提醒发送时间
+idle_nudge_group_last_seen = {}  # 指定群聊最近活跃时间
+idle_nudge_group_last_sent_at = {}  # 指定群聊上次空闲提醒发送时间
 runtime_cleanup_task = None
 idle_nudge_task = None
 
@@ -167,13 +160,6 @@ def conversation_key(event: MessageEvent) -> tuple[str, int, int | None]:
     if group_id is not None:
         return ("group", event.user_id, group_id)
     return ("private", event.user_id, None)
-
-
-def remember_session_target(session_key, event: MessageEvent) -> None:
-    session_targets[session_key] = SessionTarget(
-        user_id=event.user_id,
-        group_id=getattr(event, "group_id", None),
-    )
 
 
 def image_cache_key(event: MessageEvent) -> tuple[str, int | None]:
@@ -335,16 +321,6 @@ def has_runtime_session_state(session_key) -> bool:
         or session_key in quiz_answers
         or session_key in user_history
         or session_key in session_last_seen
-        or session_key in session_targets
-        or session_key in idle_nudge_last_sent_at
-    )
-
-
-def has_idle_nudge_session_state(session_key) -> bool:
-    return (
-        session_key in active_users
-        or session_key in user_modes
-        or session_key in quiz_answers
     )
 
 
@@ -358,13 +334,6 @@ def parse_idle_nudge_messages(message_config: str) -> list[str]:
 
 def idle_nudge_message_candidates() -> list[str]:
     return parse_idle_nudge_messages(CHAT_IDLE_NUDGE_MESSAGE)
-
-
-def idle_nudge_group_allowed(target: SessionTarget) -> bool:
-    return (
-        target.group_id is not None
-        and target.group_id in CHAT_IDLE_NUDGE_GROUP_IDS
-    )
 
 
 def choose_idle_nudge_message() -> str:
@@ -385,29 +354,43 @@ def idle_nudge_loop_interval() -> float:
     return max(1.0, min(60.0, CHAT_IDLE_NUDGE_SECONDS / 2))
 
 
-def should_send_idle_nudge(session_key, now: float) -> bool:
-    if not idle_nudge_enabled():
-        return False
-    target = session_targets.get(session_key)
-    if target is None or not idle_nudge_group_allowed(target):
-        return False
-    if not has_idle_nudge_session_state(session_key):
+def idle_nudge_group_allowed(group_id: int | None) -> bool:
+    return group_id is not None and group_id in CHAT_IDLE_NUDGE_GROUP_IDS
+
+
+def record_idle_nudge_group_activity(
+    group_id: int | None,
+    now: float | None = None,
+) -> bool:
+    if not idle_nudge_group_allowed(group_id):
         return False
 
-    last_seen = session_last_seen.get(session_key)
+    current_time = now if now is not None else time.monotonic()
+    idle_nudge_group_last_seen[group_id] = current_time
+    idle_nudge_group_last_sent_at.pop(group_id, None)
+    return True
+
+
+def should_send_idle_nudge(group_id: int, now: float) -> bool:
+    if not idle_nudge_enabled():
+        return False
+    if not idle_nudge_group_allowed(group_id):
+        return False
+
+    last_seen = idle_nudge_group_last_seen.get(group_id)
     if last_seen is None:
         return False
-    last_nudge_sent_at = idle_nudge_last_sent_at.get(session_key)
+    last_nudge_sent_at = idle_nudge_group_last_sent_at.get(group_id)
     baseline = max(last_seen, last_nudge_sent_at or last_seen)
     return now - baseline >= CHAT_IDLE_NUDGE_SECONDS
 
 
-def get_due_idle_nudge_sessions(now: float | None = None) -> list:
+def get_due_idle_nudge_groups(now: float | None = None) -> list[int]:
     current_time = now if now is not None else time.monotonic()
     return [
-        session_key
-        for session_key in list(session_last_seen)
-        if should_send_idle_nudge(session_key, current_time)
+        group_id
+        for group_id in list(idle_nudge_group_last_seen)
+        if should_send_idle_nudge(group_id, current_time)
     ]
 
 
@@ -483,7 +466,6 @@ async def cancel_memory_update_tasks() -> None:
 
 def touch_session(session_key, now: float | None = None) -> None:
     session_last_seen[session_key] = now if now is not None else time.monotonic()
-    idle_nudge_last_sent_at.pop(session_key, None)
 
 
 def clear_runtime_session_state(session_key) -> None:
@@ -493,8 +475,6 @@ def clear_runtime_session_state(session_key) -> None:
     quiz_answers.pop(session_key, None)
     user_history.pop(session_key, None)
     session_last_seen.pop(session_key, None)
-    session_targets.pop(session_key, None)
-    idle_nudge_last_sent_at.pop(session_key, None)
     drop_idle_session_lock(session_key)
 
 
@@ -545,37 +525,30 @@ def cleanup_runtime_state(now: float | None = None) -> tuple[int, int]:
     return len(expired_sessions), len(expired_image_caches)
 
 
-async def send_idle_nudge_message(bot: Bot, target: SessionTarget) -> None:
-    if target.group_id is None:
-        return
-
+async def send_idle_nudge_message(bot: Bot, group_id: int) -> None:
     message = Message(choose_idle_nudge_message())
     await bot.call_api(
         "send_group_msg",
-        group_id=target.group_id,
+        group_id=group_id,
         message=message,
     )
 
 
-async def try_send_idle_nudge(bot: Bot, session_key, now: float) -> bool:
-    async with get_session_lock(session_key):
-        if not should_send_idle_nudge(session_key, now):
-            return False
-        target = session_targets.get(session_key)
-        if target is None:
-            return False
+async def try_send_idle_nudge(bot: Bot, group_id: int, now: float) -> bool:
+    if not should_send_idle_nudge(group_id, now):
+        return False
 
-        await send_idle_nudge_message(bot, target)
-        idle_nudge_last_sent_at[session_key] = now
-        return True
+    await send_idle_nudge_message(bot, group_id)
+    idle_nudge_group_last_sent_at[group_id] = now
+    return True
 
 
 async def send_due_idle_nudges(bot: Bot, now: float | None = None) -> int:
     current_time = now if now is not None else time.monotonic()
     sent_count = 0
-    for session_key in get_due_idle_nudge_sessions(current_time):
+    for group_id in get_due_idle_nudge_groups(current_time):
         try:
-            if await try_send_idle_nudge(bot, session_key, current_time):
+            if await try_send_idle_nudge(bot, group_id, current_time):
                 sent_count += 1
         except Exception as error:
             logger.warning("发送空闲提醒失败：{}", error)
@@ -714,7 +687,6 @@ roleplay_cmd = on_command("角色扮演", priority=3, block=True)
 async def handle_roleplay(event: MessageEvent):
     session_key = conversation_key(event)
     async with get_session_lock(session_key):
-        remember_session_target(session_key, event)
         start_role_selection(session_key)
     await roleplay_cmd.finish(Message("🎭 选择角色：\n1️⃣ 侦探柯南\n2️⃣ 猫娘\n3️⃣ 古代谋士\n4️⃣ 毒舌导师\n\n回复数字选择"))
 
@@ -724,7 +696,6 @@ exit_role_cmd = on_command("退出角色", priority=3, block=True)
 async def handle_exit_role(event: MessageEvent):
     session_key = conversation_key(event)
     async with get_session_lock(session_key):
-        remember_session_target(session_key, event)
         exit_roleplay_state(session_key)
     await exit_role_cmd.finish("✅ 已退出角色扮演")
 
@@ -739,7 +710,6 @@ async def handle_quiz(event: MessageEvent):
     session_key = conversation_key(event)
     try:
         async with get_session_lock(session_key):
-            remember_session_target(session_key, event)
             response = await client.chat.completions.create(
                 model=model_name,
                 messages=build_quiz_question_messages(),
@@ -933,6 +903,7 @@ bye_chat = on_message(rule=Rule(bye_rule), priority=4, block=True)
 greet_chat = on_message(rule=Rule(greet_rule), priority=5, block=True)
 chat_at = on_message(rule=to_me() & Rule(not_blocked), priority=15, block=True)
 active_chat = on_message(rule=Rule(active_rule), priority=16, block=True)
+idle_nudge_activity_tracker = on_message(priority=1, block=False)
 
 
 TITLE_MENTION_LABEL_SEPARATORS = set(" \t\r\n，,：:、。.!！?？；;")
@@ -1278,7 +1249,6 @@ async def process_chat(matcher, bot: Bot, event: MessageEvent):
 
     session_key = conversation_key(event)
     async with get_session_lock(session_key):
-        remember_session_target(session_key, event)
         await process_chat_locked(matcher, bot, event, session_key)
 
 
@@ -1383,6 +1353,11 @@ async def handle_chat_at(bot: Bot, event: MessageEvent):
     active_users.add(session_key)
     touch_session(session_key)
     await process_chat(chat_at, bot, event)
+
+
+@idle_nudge_activity_tracker.handle()
+async def handle_idle_nudge_activity(event: MessageEvent):
+    record_idle_nudge_group_activity(getattr(event, "group_id", None))
 
 
 @get_driver().on_startup
