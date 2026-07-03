@@ -1,11 +1,13 @@
 """联网搜索插件。
 
-显式触发时访问搜索引擎，提取搜索结果摘要，再交给 OpenAI 兼容模型
-基于资料回答。普通聊天不会自动联网，避免无意外发外部请求。
+显式触发时访问搜索引擎，提取搜索结果摘要，并抓取前几条结果页面正文摘录，
+再交给 OpenAI 兼容模型基于资料回答。普通聊天不会自动联网，避免无意外发外部请求。
 """
 
+import asyncio
 import re
 from dataclasses import dataclass
+from datetime import date
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -46,6 +48,8 @@ model_name = getattr(config, "openai_model", "gpt-5.4-mini")
 client = AsyncOpenAI(api_key=api_key, base_url=base_url) if api_key else None
 
 WEB_SEARCH_MAX_RESULTS = _read_int("web_search_max_results", 5)
+WEB_SEARCH_FETCH_PAGES = _read_int("web_search_fetch_pages", 3)
+WEB_SEARCH_PAGE_MAX_CHARS = _read_int("web_search_page_max_chars", 1800)
 WEB_SEARCH_COMMAND_COOLDOWN = _read_float("web_search_command_cooldown", 15.0)
 WEB_SEARCH_REPLY_MAX_CHARS = _read_int("web_search_reply_max_chars", 900)
 WEB_SEARCH_TIMEOUT = httpx.Timeout(15.0)
@@ -79,10 +83,18 @@ class WebSearchResult:
     title: str
     url: str
     snippet: str
+    page_excerpt: str = ""
 
 
 def compact_text(text: Any) -> str:
     return " ".join(str(text).split())
+
+
+def truncate_text(text: str, max_chars: int) -> str:
+    text = compact_text(text)
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "…"
 
 
 def clean_duckduckgo_url(href: str) -> str:
@@ -186,8 +198,147 @@ def parse_duckduckgo_results(html: str, limit: int) -> list[WebSearchResult]:
     return parser.results[:limit]
 
 
+FRESH_QUERY_KEYWORDS = (
+    "最新",
+    "今天",
+    "今日",
+    "现在",
+    "当前",
+    "实时",
+    "新闻",
+    "价格",
+    "版本",
+    "发布",
+    "上线",
+    "更新",
+)
+
+OFFICIAL_RESULT_HINTS = (
+    "官方",
+    "官网",
+    "公告",
+    "新闻",
+    "发布",
+    "更新",
+    "版本",
+)
+
+
+def query_needs_freshness(query: str) -> bool:
+    return any(keyword in query for keyword in FRESH_QUERY_KEYWORDS)
+
+
+def build_effective_search_query(query: str) -> str:
+    if not query_needs_freshness(query):
+        return query
+    if "官方" in query or "官网" in query:
+        return query
+    return f"{query} 官方 最新"
+
+
 def build_duckduckgo_search_url(query: str) -> str:
-    return f"https://html.duckduckgo.com/html/?q={quote(query, safe='')}"
+    effective_query = build_effective_search_query(query)
+    return f"https://html.duckduckgo.com/html/?q={quote(effective_query, safe='')}"
+
+
+def official_result_score(result: WebSearchResult) -> int:
+    text = f"{result.title} {result.url} {result.snippet}"
+    return sum(1 for hint in OFFICIAL_RESULT_HINTS if hint in text)
+
+
+def prioritize_results(query: str, results: list[WebSearchResult]) -> list[WebSearchResult]:
+    if not query_needs_freshness(query):
+        return results
+    return sorted(
+        results,
+        key=lambda result: official_result_score(result),
+        reverse=True,
+    )
+
+
+class ReadableHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self._ignored_depth = 0
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        if tag in {"script", "style", "noscript", "svg"}:
+            self._ignored_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "noscript", "svg"} and self._ignored_depth:
+            self._ignored_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._ignored_depth:
+            return
+        text = compact_text(data)
+        if len(text) >= 2:
+            self.parts.append(text)
+
+
+def extract_readable_text(html: str, max_chars: int = WEB_SEARCH_PAGE_MAX_CHARS) -> str:
+    parser = ReadableHTMLParser()
+    parser.feed(html)
+    parser.close()
+    return truncate_text(" ".join(parser.parts), max_chars)
+
+
+def should_fetch_result_page(url: str) -> bool:
+    parsed = urlparse(url)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+async def fetch_page_excerpt(
+    http_client: httpx.AsyncClient,
+    result: WebSearchResult,
+) -> WebSearchResult:
+    if not should_fetch_result_page(result.url):
+        return result
+
+    try:
+        response = await http_client.get(result.url)
+        response.raise_for_status()
+    except httpx.HTTPError as error:
+        logger.info("抓取联网搜索页面失败，跳过 {}：{}", result.url, error)
+        return result
+
+    content_type = response.headers.get("content-type", "").lower()
+    if content_type and "html" not in content_type and "text/plain" not in content_type:
+        return result
+
+    page_excerpt = extract_readable_text(response.text)
+    if not page_excerpt:
+        return result
+    return WebSearchResult(
+        title=result.title,
+        url=result.url,
+        snippet=result.snippet,
+        page_excerpt=page_excerpt,
+    )
+
+
+async def enrich_search_results(
+    http_client: httpx.AsyncClient,
+    results: list[WebSearchResult],
+    fetch_pages: int = WEB_SEARCH_FETCH_PAGES,
+) -> list[WebSearchResult]:
+    if fetch_pages <= 0 or not results:
+        return results
+
+    fetch_count = min(fetch_pages, len(results))
+    enriched_head = await asyncio.gather(
+        *(
+            fetch_page_excerpt(http_client, result)
+            for result in results[:fetch_count]
+        )
+    )
+    return list(enriched_head) + results[fetch_count:]
 
 
 def parse_quick_web_search(text: str) -> str | None:
@@ -214,18 +365,22 @@ async def search_web(
 ) -> list[WebSearchResult]:
     response = await http_client.get(build_duckduckgo_search_url(query))
     response.raise_for_status()
-    return parse_duckduckgo_results(response.text, limit)
+    results = prioritize_results(query, parse_duckduckgo_results(response.text, limit))
+    return await enrich_search_results(http_client, results)
 
 
 def build_web_answer_messages(
     query: str,
     results: list[WebSearchResult],
+    current_date: str | None = None,
 ) -> list[dict[str, str]]:
+    current_date = current_date or date.today().isoformat()
     search_context = "\n\n".join(
         (
             f"[{index}] {result.title}\n"
             f"URL：{result.url}\n"
-            f"摘要：{result.snippet or '（无摘要）'}"
+            f"搜索摘要：{result.snippet or '（无摘要）'}\n"
+            f"页面正文摘录：{result.page_excerpt or '（未抓取到正文）'}"
         )
         for index, result in enumerate(results, start=1)
     )
@@ -234,9 +389,10 @@ def build_web_answer_messages(
             "role": "system",
             "content": (
                 "你在 QQ 群里基于联网搜索结果回答问题。"
-                "只能使用给定搜索结果，不要编造未出现的事实；资料不足就直说没搜到可靠信息。"
+                f"今天日期是 {current_date}。"
+                "只能使用给定搜索结果和页面正文摘录，不要编造未出现的事实；资料不足就直说没搜到可靠信息。"
                 "回答要短，通常 2-5 句，口语自然，不要 Markdown 表格。"
-                "涉及新闻、价格、版本、政策等时效信息时，提醒结果来自当前搜索。"
+                "涉及新闻、价格、版本、政策等时效信息时，优先采用页面正文摘录和官方结果，并说明结果来自当前搜索。"
                 "末尾用一行写来源，格式：来源：1 标题；2 标题。"
             ),
         },

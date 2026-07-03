@@ -19,8 +19,20 @@ class DuckDuckGoUrlTest(unittest.TestCase):
 
     def test_build_search_url_percent_encodes_chinese(self):
         self.assertEqual(
-            web_search.build_duckduckgo_search_url("Python 最新版本"),
-            "https://html.duckduckgo.com/html/?q=Python%20%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC",
+            web_search.build_duckduckgo_search_url("Python 教程"),
+            "https://html.duckduckgo.com/html/?q=Python%20%E6%95%99%E7%A8%8B",
+        )
+
+    def test_fresh_query_adds_official_latest_terms(self):
+        self.assertEqual(
+            web_search.build_effective_search_query("王者荣耀最新英雄"),
+            "王者荣耀最新英雄 官方 最新",
+        )
+
+    def test_fresh_query_keeps_existing_official_term(self):
+        self.assertEqual(
+            web_search.build_effective_search_query("王者荣耀官方最新英雄"),
+            "王者荣耀官方最新英雄",
         )
 
 
@@ -68,6 +80,43 @@ class DuckDuckGoParserTest(unittest.TestCase):
         )
 
 
+class WebPageExtractTest(unittest.TestCase):
+    def test_extracts_readable_text_and_skips_script_style(self):
+        html = """
+        <html>
+          <head><style>.hidden{display:none}</style><script>var stale='old'</script></head>
+          <body>
+            <h1>最新公告</h1>
+            <p>新英雄今天上线。</p>
+          </body>
+        </html>
+        """
+
+        self.assertEqual(
+            web_search.extract_readable_text(html),
+            "最新公告 新英雄今天上线。",
+        )
+
+    def test_prioritizes_official_results_for_fresh_queries(self):
+        results = [
+            web_search.WebSearchResult(
+                title="玩家整理",
+                url="https://example.com/a",
+                snippet="民间列表",
+            ),
+            web_search.WebSearchResult(
+                title="官方公告",
+                url="https://example.com/b",
+                snippet="最新发布",
+            ),
+        ]
+
+        self.assertEqual(
+            web_search.prioritize_results("最新英雄", results),
+            [results[1], results[0]],
+        )
+
+
 class WebSearchCommandParseTest(unittest.TestCase):
     def test_parses_quick_web_search(self):
         self.assertEqual(
@@ -110,15 +159,19 @@ class WebAnswerPromptTest(unittest.TestCase):
                     title="Python Releases",
                     url="https://www.python.org/downloads/",
                     snippet="The latest Python release is listed here.",
+                    page_excerpt="Python 3.14.0 is the newest major release.",
                 )
             ],
+            current_date="2026-07-03",
         )
 
         self.assertEqual(messages[0]["role"], "system")
         self.assertIn("只能使用给定搜索结果", messages[0]["content"])
+        self.assertIn("今天日期是 2026-07-03", messages[0]["content"])
         self.assertIn("资料不足", messages[0]["content"])
         self.assertIn("Python Releases", messages[1]["content"])
         self.assertIn("https://www.python.org/downloads/", messages[1]["content"])
+        self.assertIn("Python 3.14.0 is the newest major release.", messages[1]["content"])
 
     def test_trim_reply_adds_ellipsis(self):
         self.assertEqual(web_search.trim_reply("abcdef", max_chars=4), "abc…")
