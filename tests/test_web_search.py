@@ -1,4 +1,8 @@
+import asyncio
 import unittest
+from unittest.mock import patch
+
+import httpx
 
 import nonebot
 
@@ -6,6 +10,34 @@ import nonebot
 nonebot.init()
 
 import plugins.web_search as web_search  # noqa: E402
+
+
+class FakeResponse:
+    def __init__(self, text: str, headers: dict[str, str] | None = None) -> None:
+        self.text = text
+        self.headers = headers or {"content-type": "text/html"}
+
+    def raise_for_status(self) -> None:
+        return None
+
+
+class FakeWebClient:
+    def __init__(self, search_html: str = "") -> None:
+        self.search_html = search_html
+        self.cancelled_urls: list[str] = []
+
+    async def get(self, url: str) -> FakeResponse:
+        if "duckduckgo.com" in url:
+            return FakeResponse(self.search_html)
+        if url.endswith("/slow"):
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                self.cancelled_urls.append(url)
+                raise
+        if url.endswith("/fail"):
+            raise httpx.ConnectError("page unavailable")
+        return FakeResponse(f"<html><body><p>正文 {url}</p></body></html>")
 
 
 class DuckDuckGoUrlTest(unittest.TestCase):
@@ -115,6 +147,55 @@ class WebPageExtractTest(unittest.TestCase):
             web_search.prioritize_results("最新英雄", results),
             [results[1], results[0]],
         )
+
+
+class WebSearchEnrichTest(unittest.IsolatedAsyncioTestCase):
+    async def test_search_web_returns_results_when_one_page_times_out(self):
+        search_html = """
+        <a class="result__a" href="https://example.com/fast">Fast</a>
+        <a class="result__snippet">Fast snippet</a>
+        <a class="result__a" href="https://example.com/slow">Slow</a>
+        <a class="result__snippet">Slow snippet</a>
+        """
+        http_client = FakeWebClient(search_html)
+
+        started_at = asyncio.get_running_loop().time()
+        with patch.object(web_search, "WEB_SEARCH_PAGE_ENRICH_TIMEOUT", 0.01):
+            results = await web_search.search_web(http_client, "test", limit=2)
+        elapsed = asyncio.get_running_loop().time() - started_at
+
+        self.assertLess(elapsed, 0.2)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0].page_excerpt, "正文 https://example.com/fast")
+        self.assertEqual(results[1].title, "Slow")
+        self.assertEqual(results[1].snippet, "Slow snippet")
+        self.assertEqual(results[1].page_excerpt, "")
+        self.assertEqual(http_client.cancelled_urls, ["https://example.com/slow"])
+
+    async def test_enrich_keeps_results_when_one_page_fails(self):
+        results = [
+            web_search.WebSearchResult(
+                title="OK",
+                url="https://example.com/ok",
+                snippet="ok snippet",
+            ),
+            web_search.WebSearchResult(
+                title="Fail",
+                url="https://example.com/fail",
+                snippet="fail snippet",
+            ),
+        ]
+
+        enriched = await web_search.enrich_search_results(
+            FakeWebClient(),
+            results,
+            fetch_pages=2,
+            fetch_timeout=1.0,
+        )
+
+        self.assertEqual(len(enriched), 2)
+        self.assertEqual(enriched[0].page_excerpt, "正文 https://example.com/ok")
+        self.assertEqual(enriched[1], results[1])
 
 
 class WebSearchCommandParseTest(unittest.TestCase):

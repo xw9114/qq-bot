@@ -52,6 +52,7 @@ WEB_SEARCH_FETCH_PAGES = _read_int("web_search_fetch_pages", 3)
 WEB_SEARCH_PAGE_MAX_CHARS = _read_int("web_search_page_max_chars", 1800)
 WEB_SEARCH_COMMAND_COOLDOWN = _read_float("web_search_command_cooldown", 15.0)
 WEB_SEARCH_REPLY_MAX_CHARS = _read_int("web_search_reply_max_chars", 900)
+WEB_SEARCH_PAGE_ENRICH_TIMEOUT = _read_float("web_search_page_enrich_timeout", 3.0)
 WEB_SEARCH_TIMEOUT = httpx.Timeout(15.0)
 WEB_SEARCH_HEADERS = {
     "User-Agent": (
@@ -327,17 +328,38 @@ async def enrich_search_results(
     http_client: httpx.AsyncClient,
     results: list[WebSearchResult],
     fetch_pages: int = WEB_SEARCH_FETCH_PAGES,
+    fetch_timeout: float | None = None,
 ) -> list[WebSearchResult]:
     if fetch_pages <= 0 or not results:
         return results
 
     fetch_count = min(fetch_pages, len(results))
-    enriched_head = await asyncio.gather(
-        *(
-            fetch_page_excerpt(http_client, result)
-            for result in results[:fetch_count]
-        )
-    )
+    fetch_timeout = WEB_SEARCH_PAGE_ENRICH_TIMEOUT if fetch_timeout is None else fetch_timeout
+    if fetch_timeout <= 0:
+        return results
+
+    head = results[:fetch_count]
+    tasks = [
+        asyncio.create_task(fetch_page_excerpt(http_client, result))
+        for result in head
+    ]
+    done, pending = await asyncio.wait(tasks, timeout=fetch_timeout)
+
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+        logger.info("联网搜索正文抓取超时，跳过 {} 个慢页面", len(pending))
+
+    enriched_head = list(head)
+    for index, task in enumerate(tasks):
+        if task not in done or task.cancelled():
+            continue
+        try:
+            enriched_head[index] = task.result()
+        except Exception as error:
+            logger.info("联网搜索正文抓取失败，保留搜索摘要：{}", error)
+
     return list(enriched_head) + results[fetch_count:]
 
 
