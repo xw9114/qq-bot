@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -8,6 +9,9 @@ import nonebot
 nonebot.init()
 
 import plugins.music_chat as music_chat  # noqa: E402
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class CountingStream(httpx.AsyncByteStream):
@@ -270,6 +274,21 @@ class MusicSelectionStateTest(unittest.TestCase):
         self.assertEqual(status, "missing")
         self.assertIsNone(candidate)
         self.assertIn(first_group, music_chat.pending_music_selections)
+
+
+class MusicUserVisibleDocsTest(unittest.TestCase):
+    def test_readme_documents_selection_timeout(self):
+        readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("回复序号确认", readme)
+        self.assertIn("MUSIC_SELECTION_TIMEOUT", readme)
+        self.assertIn("这次点歌候选已超时，请重新点歌", readme)
+
+    def test_env_example_exposes_selection_timeout(self):
+        env_example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
+
+        self.assertIn("搜歌候选等待回复序号的超时秒数", env_example)
+        self.assertIn("MUSIC_SELECTION_TIMEOUT=60", env_example)
 
 
 class ParseSongUrlResultTest(unittest.TestCase):

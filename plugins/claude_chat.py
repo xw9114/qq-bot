@@ -579,9 +579,7 @@ async def idle_nudge_loop() -> None:
             logger.info("已发送 {} 条空闲提醒", sent_count)
 
 
-@help_cmd.handle()
-async def handle_help(event: MessageEvent):
-    msg = """🤖 可用指令一览
+HELP_MESSAGE = """🤖 可用指令一览
 
 ━━━━━━━━━━━━━━━
 💬 AI 对话
@@ -617,7 +615,9 @@ async def handle_help(event: MessageEvent):
 
 ━━━━━━━━━━━━━━━
 🎵 点歌
-  /点歌 [歌名/ID/链接]  搜歌或直接发网易云链接，点歌播放
+  /点歌 [歌名]   返回 3-5 首候选，回复序号确认
+  /点歌 [ID/链接]  直接点网易云歌曲
+  （候选默认 60 秒超时，超时后需重新点歌）
 
 ━━━━━━━━━━━━━━━
 🎮 娱乐
@@ -650,7 +650,11 @@ async def handle_help(event: MessageEvent):
 
 ━━━━━━━━━━━━━━━
 ❓ /help       显示此帮助"""
-    await help_cmd.finish(Message(msg))
+
+
+@help_cmd.handle()
+async def handle_help(event: MessageEvent):
+    await help_cmd.finish(Message(HELP_MESSAGE))
 
 
 view_memory_cmd = on_command("查看记忆", priority=3, block=True)

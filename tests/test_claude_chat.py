@@ -341,6 +341,13 @@ class ClaudeChatTriggerRuleTest(unittest.TestCase):
         self.assertTrue(is_plugin_command("帮我搜一下 Python 最新版本"))
 
 
+class ClaudeChatHelpMessageTest(unittest.TestCase):
+    def test_music_help_describes_candidate_confirmation(self):
+        self.assertIn("/点歌 [歌名]   返回 3-5 首候选，回复序号确认", claude_chat.HELP_MESSAGE)
+        self.assertIn("/点歌 [ID/链接]  直接点网易云歌曲", claude_chat.HELP_MESSAGE)
+        self.assertIn("候选默认 60 秒超时，超时后需重新点歌", claude_chat.HELP_MESSAGE)
+
+
 class ClaudeChatPromptTest(unittest.TestCase):
     def tearDown(self):
         user_modes.clear()
