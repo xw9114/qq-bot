@@ -1,6 +1,5 @@
 import asyncio
 import sqlite3
-import tempfile
 import unittest
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -511,73 +510,76 @@ class ClaudeChatMemoryInjectionTest(unittest.TestCase):
             return []
 
         async def run_test():
-            with tempfile.TemporaryDirectory() as temp_dir:
-                database_path = Path(temp_dir) / "memory.db"
-                store = LongTermMemoryStore(database_path, use_wal=False)
-                session_key = ("group", 12345, 10000)
-                await store.upsert_summary(
+            database_path = (
+                Path(__file__).resolve().parents[1]
+                / ".test_artifacts"
+                / "test_claude_chat_memory.db"
+            )
+            store = LongTermMemoryStore(database_path, use_wal=False)
+            session_key = ("group", 12345, 10000)
+            await store.upsert_summary(
+                session_key,
+                "事项：很久以前在准备考试",
+            )
+
+            stale_updated_at = (
+                datetime.now(timezone.utc)
+                - LONG_TERM_MEMORY_INJECTION_TTL
+                - timedelta(seconds=1)
+            )
+            with closing(sqlite3.connect(database_path)) as connection:
+                with connection:
+                    connection.execute(
+                        "UPDATE chat_memory SET updated_at = ?",
+                        (stale_updated_at.isoformat(),),
+                    )
+
+            completions = FakeCompletions()
+            fake_client = SimpleNamespace(
+                chat=SimpleNamespace(completions=completions)
+            )
+            event = SimpleNamespace(
+                user_id=12345,
+                group_id=10000,
+                get_plaintext=lambda: "现在聊点别的",
+                get_message=lambda: Message("现在聊点别的"),
+            )
+
+            original_client = claude_chat.client
+            original_store = claude_chat.memory_store
+            original_get_user_title_prompt = claude_chat.get_user_title_prompt
+            original_get_mentioned_title_records = (
+                claude_chat.get_mentioned_title_records
+            )
+            original_get_mentioned_titles_prompt = (
+                claude_chat.get_mentioned_titles_prompt
+            )
+            claude_chat.client = fake_client
+            claude_chat.memory_store = store
+            claude_chat.get_user_title_prompt = empty_prompt
+            claude_chat.get_mentioned_title_records = empty_records
+            claude_chat.get_mentioned_titles_prompt = empty_prompt
+            try:
+                await claude_chat.process_chat_locked(
+                    FakeMatcher(),
+                    SimpleNamespace(),
+                    event,
                     session_key,
-                    "事项：很久以前在准备考试",
+                )
+            finally:
+                claude_chat.client = original_client
+                claude_chat.memory_store = original_store
+                claude_chat.get_user_title_prompt = original_get_user_title_prompt
+                claude_chat.get_mentioned_title_records = (
+                    original_get_mentioned_title_records
+                )
+                claude_chat.get_mentioned_titles_prompt = (
+                    original_get_mentioned_titles_prompt
                 )
 
-                stale_updated_at = (
-                    datetime.now(timezone.utc)
-                    - LONG_TERM_MEMORY_INJECTION_TTL
-                    - timedelta(seconds=1)
-                )
-                with closing(sqlite3.connect(database_path)) as connection:
-                    with connection:
-                        connection.execute(
-                            "UPDATE chat_memory SET updated_at = ?",
-                            (stale_updated_at.isoformat(),),
-                        )
-
-                completions = FakeCompletions()
-                fake_client = SimpleNamespace(
-                    chat=SimpleNamespace(completions=completions)
-                )
-                event = SimpleNamespace(
-                    user_id=12345,
-                    group_id=10000,
-                    get_plaintext=lambda: "现在聊点别的",
-                    get_message=lambda: Message("现在聊点别的"),
-                )
-
-                original_client = claude_chat.client
-                original_store = claude_chat.memory_store
-                original_get_user_title_prompt = claude_chat.get_user_title_prompt
-                original_get_mentioned_title_records = (
-                    claude_chat.get_mentioned_title_records
-                )
-                original_get_mentioned_titles_prompt = (
-                    claude_chat.get_mentioned_titles_prompt
-                )
-                claude_chat.client = fake_client
-                claude_chat.memory_store = store
-                claude_chat.get_user_title_prompt = empty_prompt
-                claude_chat.get_mentioned_title_records = empty_records
-                claude_chat.get_mentioned_titles_prompt = empty_prompt
-                try:
-                    await claude_chat.process_chat_locked(
-                        FakeMatcher(),
-                        SimpleNamespace(),
-                        event,
-                        session_key,
-                    )
-                finally:
-                    claude_chat.client = original_client
-                    claude_chat.memory_store = original_store
-                    claude_chat.get_user_title_prompt = original_get_user_title_prompt
-                    claude_chat.get_mentioned_title_records = (
-                        original_get_mentioned_title_records
-                    )
-                    claude_chat.get_mentioned_titles_prompt = (
-                        original_get_mentioned_titles_prompt
-                    )
-
-                system_prompt = completions.calls[0]["messages"][0]["content"]
-                self.assertNotIn("当前会话的长期记忆摘要", system_prompt)
-                self.assertNotIn("很久以前在准备考试", system_prompt)
+            system_prompt = completions.calls[0]["messages"][0]["content"]
+            self.assertNotIn("当前会话的长期记忆摘要", system_prompt)
+            self.assertNotIn("很久以前在准备考试", system_prompt)
 
         asyncio.run(run_test())
 
