@@ -4,7 +4,7 @@
 
 <p align="center">
   基于 NoneBot2 与 OneBot v11 的 QQ AI 机器人<br>
-  支持连续对话、角色扮演、知识问答、棋类游戏与表情包生成
+  支持连续对话、角色扮演、联网搜索、知识问答、棋类游戏与表情包生成
 </p>
 
 <p align="center">
@@ -36,6 +36,7 @@
 | 分类 | 功能 | 常用入口 |
 | --- | --- | --- |
 | AI 对话 | 连续对话、上下文记忆、@机器人直接提问 | `你好`、`再见`、@机器人 |
+| 联网搜索 | 显式搜索网页，抓取搜索摘要和页面正文，慢页面超时自动降级 | `/联网 Python 最新版本`、`联网搜索 张雪峰`、`查一下 北京天气` |
 | 角色扮演 | 柯南、猫娘、古代谋士、毒舌导师 | `/角色扮演`、`/退出角色` |
 | 知识问答 | AI 出题、提交答案、自动判定 | `/问答`、`/答案` |
 | 轻娱乐 | 塔罗牌、笑话、一言、随机老婆 | `/塔罗`、`/笑话`、`一言`、`/抽老婆` |
@@ -153,6 +154,12 @@ ws://127.0.0.1:8080/onebot/v11/ws
 | `DATABASE_URL` | 否 | SQLite | 棋类等插件使用的数据库地址 |
 | `BOARDGAME_TIMEOUT` | 否 | `600` | 棋局超时时间，单位为秒 |
 | `MEMES_COMMAND_PREFIXES` | 否 | `["/"]` | Memes 使用独立前缀，避免与 PetPet 指令冲突 |
+| `WEB_SEARCH_MAX_RESULTS` | 否 | `5` | `/联网` 返回的搜索结果数量 |
+| `WEB_SEARCH_FETCH_PAGES` | 否 | `3` | 联网搜索后抓取正文摘录的前 N 条结果 |
+| `WEB_SEARCH_PAGE_ENRICH_TIMEOUT` | 否 | `3` | 正文抓取总等待秒数，设为 `0` 可关闭正文抓取；超时保留搜索摘要降级回答 |
+| `WEB_SEARCH_PAGE_MAX_CHARS` | 否 | `1800` | 每个页面正文摘录最大字符数 |
+| `WEB_SEARCH_COMMAND_COOLDOWN` | 否 | `15` | 同一会话触发 `/联网` 的冷却秒数，设为 `0` 可关闭 |
+| `WEB_SEARCH_REPLY_MAX_CHARS` | 否 | `900` | 联网回答最大字符数 |
 | `CHAT_IDLE_NUDGE_SECONDS` | 否 | `0` | 群白名单空闲提醒等待秒数，设为 `0` 可关闭 |
 | `CHAT_IDLE_NUDGE_GROUP_IDS` | 否 | 空 | 允许发送空闲提醒的群号白名单，多个群号用逗号分隔；留空不触发 |
 | `CHAT_IDLE_NUDGE_MESSAGE` | 否 | 内置短句 | 空闲提醒文案，多条用 `|` 分隔，发送时随机选一条 |
@@ -166,6 +173,8 @@ ws://127.0.0.1:8080/onebot/v11/ws
 | `MUSIC_SELECTION_TIMEOUT` | 否 | `60` | `/点歌` 搜歌候选等待回复序号的超时秒数，超时后需重新点歌 |
 
 当前 AI 模型可通过 `.env` 中的 `OPENAI_MODEL` 设置；使用兼容服务时，应填写该服务实际提供的模型名称。
+
+联网搜索由 `plugins/web_search.py` 实现，只在显式触发时访问外部网页，普通聊天不会自动联网。可以使用 `/联网 关键词` 或 `/搜索 关键词`，也可以直接说“联网搜索 张雪峰”“联网查一下 今天新闻”“查一下 北京天气”“搜一下 Python 最新版本”等自然语言触发词。搜索会先取 DuckDuckGo HTML 结果，再按 `WEB_SEARCH_FETCH_PAGES` 抓取前几条页面正文；`WEB_SEARCH_PAGE_ENRICH_TIMEOUT` 控制正文抓取总等待时间，慢页面超时后保留搜索摘要继续回答。
 
 群白名单空闲提醒只会在 `CHAT_IDLE_NUDGE_GROUP_IDS` 指定的群内生效：群内有消息时重新计时，超过 `CHAT_IDLE_NUDGE_SECONDS` 后发送一条提醒；未加入白名单的群和私聊不会触发。设为 `CHAT_IDLE_NUDGE_SECONDS=0` 或清空 `CHAT_IDLE_NUDGE_GROUP_IDS` 即可关闭。`CHAT_IDLE_NUDGE_MESSAGE` 可配置一条或多条提醒文案，多条用 `|` 分隔，发送时随机选择。
 
@@ -198,6 +207,7 @@ qq-claude-bot/
 ├── bot.py                  # NoneBot 入口与第三方插件加载
 ├── plugins/
 │   ├── claude_chat.py      # AI 对话、角色扮演、问答与娱乐指令
+│   ├── web_search.py       # 联网搜索（/联网 与自然语言触发）
 │   ├── voice_chat.py       # 文字转语音（QQ AI 声聊 + edge-tts）
 │   └── music_chat.py       # 点歌（网易云搜索/下载）
 ├── .env.example            # 可公开的配置模板

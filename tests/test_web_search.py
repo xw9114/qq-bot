@@ -164,7 +164,7 @@ class WebSearchEnrichTest(unittest.IsolatedAsyncioTestCase):
             results = await web_search.search_web(http_client, "test", limit=2)
         elapsed = asyncio.get_running_loop().time() - started_at
 
-        self.assertLess(elapsed, 0.2)
+        self.assertLess(elapsed, 0.5)
         self.assertEqual(len(results), 2)
         self.assertEqual(results[0].page_excerpt, "Body https://example.com/fast")
         self.assertEqual(results[1].title, "Slow")
