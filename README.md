@@ -153,6 +153,9 @@ ws://127.0.0.1:8080/onebot/v11/ws
 | `DATABASE_URL` | 否 | SQLite | 棋类等插件使用的数据库地址 |
 | `BOARDGAME_TIMEOUT` | 否 | `600` | 棋局超时时间，单位为秒 |
 | `MEMES_COMMAND_PREFIXES` | 否 | `["/"]` | Memes 使用独立前缀，避免与 PetPet 指令冲突 |
+| `CHAT_IDLE_NUDGE_SECONDS` | 否 | `0` | 群白名单空闲提醒等待秒数，设为 `0` 可关闭 |
+| `CHAT_IDLE_NUDGE_GROUP_IDS` | 否 | 空 | 允许发送空闲提醒的群号白名单，多个群号用逗号分隔；留空不触发 |
+| `CHAT_IDLE_NUDGE_MESSAGE` | 否 | 内置短句 | 空闲提醒文案，多条用 `|` 分隔，发送时随机选一条 |
 | `VOICE_AI_CHARACTER` | 否 | 群角色列表第一个 | QQ AI 声聊默认角色 ID |
 | `VOICE_EDGE_VOICE` | 否 | `zh-CN-XiaoxiaoNeural` | edge-tts 在线合成默认音色 |
 | `VOICE_MAX_TEXT_LEN` | 否 | `200` | 单条语音的最大文本长度 |
@@ -163,6 +166,16 @@ ws://127.0.0.1:8080/onebot/v11/ws
 | `MUSIC_SELECTION_TIMEOUT` | 否 | `60` | `/点歌` 搜歌候选等待回复序号的超时秒数，超时后需重新点歌 |
 
 当前 AI 模型可通过 `.env` 中的 `OPENAI_MODEL` 设置；使用兼容服务时，应填写该服务实际提供的模型名称。
+
+群白名单空闲提醒只会在 `CHAT_IDLE_NUDGE_GROUP_IDS` 指定的群内生效：群内有消息时重新计时，超过 `CHAT_IDLE_NUDGE_SECONDS` 后发送一条提醒；未加入白名单的群和私聊不会触发。设为 `CHAT_IDLE_NUDGE_SECONDS=0` 或清空 `CHAT_IDLE_NUDGE_GROUP_IDS` 即可关闭。`CHAT_IDLE_NUDGE_MESSAGE` 可配置一条或多条提醒文案，多条用 `|` 分隔，发送时随机选择。
+
+最小可用示例：
+
+```env
+CHAT_IDLE_NUDGE_SECONDS=300
+CHAT_IDLE_NUDGE_GROUP_IDS=123456789,987654321
+CHAT_IDLE_NUDGE_MESSAGE=还在吗|人呢，还聊不聊
+```
 
 称号管理员可以使用 `/设置称号 QQ号 称号`、`/设置称号 @用户 称号`、`/查看称号 QQ号` 和 `/删除称号 QQ号` 管理全局用户身份。使用真实 @ 设置时，机器人会优先记录群名片或昵称；也可以用 `/设置称号 QQ号 称号 | 显示名` 手动指定聊天展示名。称号数据保存在 `data/user_titles.db`，机器人重启后仍然有效。聊天中提到已登记称号时，机器人会自动把称号当作对应用户的代称来理解。
 
