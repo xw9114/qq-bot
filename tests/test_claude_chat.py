@@ -3,7 +3,6 @@ import sqlite3
 import unittest
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from types import SimpleNamespace
 
 import nonebot
@@ -52,6 +51,7 @@ from plugins.claude_chat import user_history  # noqa: E402
 from plugins.claude_chat import user_modes  # noqa: E402
 from plugins.claude_chat import user_roles  # noqa: E402
 from plugins.user_titles import UserTitleRecord  # noqa: E402
+from tests.helpers import isolated_test_path  # noqa: E402
 
 
 class ClaudeChatReplyTest(unittest.TestCase):
@@ -517,11 +517,7 @@ class ClaudeChatMemoryInjectionTest(unittest.TestCase):
             return []
 
         async def run_test():
-            database_path = (
-                Path(__file__).resolve().parents[1]
-                / ".test_artifacts"
-                / "test_claude_chat_memory.db"
-            )
+            database_path = isolated_test_path(self, "memory.db")
             store = LongTermMemoryStore(database_path, use_wal=False)
             session_key = ("group", 12345, 10000)
             await store.upsert_summary(
