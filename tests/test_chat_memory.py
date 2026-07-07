@@ -1,10 +1,8 @@
 import asyncio
 import sqlite3
-import tempfile
 import unittest
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from plugins.chat_memory import (
     LONG_TERM_MEMORY_INJECTION_TTL,
@@ -14,6 +12,7 @@ from plugins.chat_memory import (
     normalize_memory_summary,
     trim_history_for_memory,
 )
+from tests.helpers import isolated_test_path
 
 
 class ChatMemoryHelperTest(unittest.TestCase):
@@ -120,64 +119,62 @@ class ChatMemoryHelperTest(unittest.TestCase):
 class LongTermMemoryStoreTest(unittest.TestCase):
     def test_persists_summary_by_session_key(self):
         async def run_test():
-            with tempfile.TemporaryDirectory() as temp_dir:
-                store = LongTermMemoryStore(
-                    Path(temp_dir) / "memory.db",
-                    use_wal=False,
-                )
-                group_session = ("group", 12345, 10000)
-                private_session = ("private", 12345, None)
+            store = LongTermMemoryStore(
+                isolated_test_path(self, "memory.db"),
+                use_wal=False,
+            )
+            group_session = ("group", 12345, 10000)
+            private_session = ("private", 12345, None)
 
-                await store.upsert_summary(group_session, "用户在 A 群准备考试")
-                await store.upsert_summary(private_session, "用户私聊喜欢短回复")
+            await store.upsert_summary(group_session, "用户在 A 群准备考试")
+            await store.upsert_summary(private_session, "用户私聊喜欢短回复")
 
-                self.assertEqual(
-                    await store.get_summary(group_session),
-                    "用户在 A 群准备考试",
-                )
-                self.assertEqual(
-                    await store.get_summary(private_session),
-                    "用户私聊喜欢短回复",
-                )
-                self.assertTrue(await store.delete_summary(group_session))
-                self.assertEqual(await store.get_summary(group_session), "")
-                self.assertFalse(await store.delete_summary(group_session))
+            self.assertEqual(
+                await store.get_summary(group_session),
+                "用户在 A 群准备考试",
+            )
+            self.assertEqual(
+                await store.get_summary(private_session),
+                "用户私聊喜欢短回复",
+            )
+            self.assertTrue(await store.delete_summary(group_session))
+            self.assertEqual(await store.get_summary(group_session), "")
+            self.assertFalse(await store.delete_summary(group_session))
 
         asyncio.run(run_test())
 
     def test_get_injectable_summary_respects_updated_at_ttl(self):
         async def run_test():
-            with tempfile.TemporaryDirectory() as temp_dir:
-                database_path = Path(temp_dir) / "memory.db"
-                store = LongTermMemoryStore(database_path, use_wal=False)
-                session_key = ("group", 12345, 10000)
-                now = datetime(2026, 6, 30, tzinfo=timezone.utc)
+            database_path = isolated_test_path(self, "memory.db")
+            store = LongTermMemoryStore(database_path, use_wal=False)
+            session_key = ("group", 12345, 10000)
+            now = datetime(2026, 6, 30, tzinfo=timezone.utc)
 
-                await store.upsert_summary(session_key, "事项：最近在准备考试")
+            await store.upsert_summary(session_key, "事项：最近在准备考试")
 
-                self.assertEqual(
-                    await store.get_injectable_summary(session_key, now=now),
-                    "事项：最近在准备考试",
-                )
+            self.assertEqual(
+                await store.get_injectable_summary(session_key, now=now),
+                "事项：最近在准备考试",
+            )
 
-                stale_updated_at = (
-                    now - LONG_TERM_MEMORY_INJECTION_TTL - timedelta(seconds=1)
-                )
-                with closing(sqlite3.connect(database_path)) as connection:
-                    with connection:
-                        connection.execute(
-                            "UPDATE chat_memory SET updated_at = ?",
-                            (stale_updated_at.isoformat(),),
-                        )
+            stale_updated_at = (
+                now - LONG_TERM_MEMORY_INJECTION_TTL - timedelta(seconds=1)
+            )
+            with closing(sqlite3.connect(database_path)) as connection:
+                with connection:
+                    connection.execute(
+                        "UPDATE chat_memory SET updated_at = ?",
+                        (stale_updated_at.isoformat(),),
+                    )
 
-                self.assertEqual(
-                    await store.get_summary(session_key),
-                    "事项：最近在准备考试",
-                )
-                self.assertEqual(
-                    await store.get_injectable_summary(session_key, now=now),
-                    "",
-                )
+            self.assertEqual(
+                await store.get_summary(session_key),
+                "事项：最近在准备考试",
+            )
+            self.assertEqual(
+                await store.get_injectable_summary(session_key, now=now),
+                "",
+            )
 
         asyncio.run(run_test())
 

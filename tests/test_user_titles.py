@@ -1,7 +1,5 @@
 import asyncio
-import tempfile
 import unittest
-from pathlib import Path
 
 import nonebot
 from nonebot.adapters.onebot.v11 import Message, MessageSegment
@@ -18,15 +16,12 @@ from plugins.user_titles import (  # noqa: E402
     parse_target_id,
     title_store,
 )
+from tests.helpers import isolated_test_path
 
 
 class UserTitleStoreTest(unittest.TestCase):
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
-        self.store = UserTitleStore(Path(self.temp_dir.name) / "user_titles.db")
-
-    def tearDown(self):
-        self.temp_dir.cleanup()
+        self.store = UserTitleStore(isolated_test_path(self, "user_titles.db"))
 
     def test_title_lifecycle(self):
         async def run_test():
@@ -85,8 +80,7 @@ class UserTitleParsingTest(unittest.TestCase):
 
     def test_mentioned_titles_prompt(self):
         original_store = title_store
-        temp_dir = tempfile.TemporaryDirectory()
-        store = UserTitleStore(Path(temp_dir.name) / "user_titles.db")
+        store = UserTitleStore(isolated_test_path(self, "user_titles.db"))
 
         async def run_test():
             import plugins.user_titles as user_titles
@@ -108,7 +102,6 @@ class UserTitleParsingTest(unittest.TestCase):
                 self.assertNotIn("对应 QQ", prompt)
             finally:
                 user_titles.title_store = original_store
-                temp_dir.cleanup()
 
         asyncio.run(run_test())
 
